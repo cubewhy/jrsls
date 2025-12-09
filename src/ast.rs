@@ -3,7 +3,7 @@ use tree_sitter::Node;
 
 use crate::utils::get_node_text;
 
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub enum InferredType {
     Int,
     Long,

@@ -1,5 +1,8 @@
-use crate::state::{IndexedClass, IndexedMember};
 use crate::utils::{get_node_text, node_range};
+use crate::{
+    ast::parse_java_type,
+    state::{IndexedClass, IndexedMember},
+};
 use ropey::Rope;
 use tower_lsp::lsp_types;
 use tree_sitter::StreamingIterator;
@@ -103,11 +106,36 @@ fn collect_members(
             if let Some(name_node) = child.child_by_field_name("name") {
                 let name = get_node_text(name_node, rope);
                 let fqmn = format!("{}.{}", fqcn, name);
+
+                let params_node = child.child_by_field_name("parameters");
+                let mut params = Vec::new();
+                if let Some(p) = params_node {
+                    let mut p_cursor = p.walk();
+                    for param in p.children(&mut p_cursor) {
+                        if param.kind() == "formal_parameter" || param.kind() == "spread_parameter"
+                        {
+                            params.push(param);
+                        }
+                    }
+                }
+                let is_varargs = params
+                    .last()
+                    .is_some_and(|p| p.kind() == "spread_parameter");
+                let param_count = params.len();
+                let param_types = params
+                    .iter()
+                    .filter_map(|p| p.child_by_field_name("type"))
+                    .map(|t| parse_java_type(t, rope))
+                    .collect();
+
                 members.push(IndexedMember {
                     name,
                     fqmn,
                     uri: uri.clone(),
                     range: node_range(name_node, rope),
+                    param_count,
+                    is_varargs,
+                    param_types,
                 });
             }
         } else if child.kind() == "field_declaration" {
@@ -123,6 +151,9 @@ fn collect_members(
                         fqmn,
                         uri: uri.clone(),
                         range: node_range(name_node, rope),
+                        param_count: 0,
+                        is_varargs: false,
+                        param_types: Vec::new(),
                     });
                 }
             }

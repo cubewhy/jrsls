@@ -129,7 +129,7 @@ pub fn search_fields_in_class(class_body: Node, target_name: &str, rope: &Rope) 
     None
 }
 
-fn calculate_score(arg_type: &InferredType, param_type: &InferredType) -> i32 {
+pub fn calculate_score(arg_type: &InferredType, param_type: &InferredType) -> i32 {
     if arg_type == param_type {
         return 100;
     }
@@ -181,19 +181,39 @@ fn search_class_member(
             let mut p_cursor = params_node.walk();
             let def_params: Vec<Node> = params_node
                 .children(&mut p_cursor)
-                .filter(|n| n.kind() == "formal_parameter")
+                .filter(|n| n.kind() == "formal_parameter" || n.kind() == "spread_parameter")
                 .collect();
-
-            if call_args.len() != def_params.len() {
-                continue;
-            }
 
             let mut current_score = 0;
             let mut mismatch = false;
 
+            let has_varargs = def_params
+                .last()
+                .is_some_and(|p| p.kind() == "spread_parameter");
+            let required_params = if has_varargs {
+                def_params.len().saturating_sub(1)
+            } else {
+                def_params.len()
+            };
+
+            if (!has_varargs && call_args.len() != required_params)
+                || (has_varargs && call_args.len() < required_params)
+            {
+                continue;
+            }
+
             for (i, arg_node) in call_args.iter().enumerate() {
-                let def_param = def_params[i];
-                let def_type_node = def_param.child_by_field_name("type").unwrap();
+                let def_param_idx = if has_varargs && i >= required_params {
+                    def_params.len() - 1
+                } else {
+                    i
+                };
+
+                let def_param = def_params[def_param_idx];
+                let Some(def_type_node) = def_param.child_by_field_name("type") else {
+                    mismatch = true;
+                    break;
+                };
 
                 let solver = TypeSolver::new(rope, index, uri);
                 let arg_type = solver.infer(*arg_node);

@@ -1,8 +1,9 @@
 use super::LanguageService;
 use crate::{
     ast::get_call_args,
+    inference::TypeSolver,
     state::{self, GlobalIndex},
-    utils::{find_definition_in_file, get_node_at_pos, get_node_text, node_range},
+    utils::{calculate_score, find_definition_in_file, get_node_at_pos, get_node_text, node_range},
 };
 use ropey::Rope;
 use tower_lsp::lsp_types::{self, DocumentSymbol, Location, Position, SymbolKind};
@@ -85,6 +86,8 @@ impl LanguageService for JavaService {
             &file_info,
             index,
             qualifier.as_deref(),
+            &call_args,
+            current_uri,
         ) {
             return Some(loc);
         }
@@ -168,40 +171,169 @@ fn match_member(
     file_info: &state::FileInfo,
     index: &GlobalIndex,
     qualifier: Option<&str>,
+    call_args: &[Node],
+    current_uri: &str,
 ) -> Option<Location> {
     // Attempt to use the qualifier's type to narrow down the member
-    let qualifier = match qualifier {
-        Some(q) => q.to_string(),
-        None => resolve_qualifier(node, rope)?,
-    };
+    let qualifier = qualifier
+        .map(|q| q.to_string())
+        .or_else(|| resolve_qualifier(node, rope))
+        .unwrap_or_default();
     let qualifier_candidates = index.classes_by_short_name(&qualifier);
     let qualifier_fqcn = resolve_qualifier_fqcn(&qualifier, &qualifier_candidates, file_info);
+    let fqcn = qualifier_fqcn.clone().unwrap_or_default();
+    let arg_count = count_args(node);
 
-    let fqcn = qualifier_fqcn?;
-
-    let mut candidates: Vec<_> = members
+    let candidates: Vec<_> = members
         .iter()
-        .filter(|m| m.fqmn.starts_with(&format!("{}.", fqcn)))
+        .filter(|m| fqcn.is_empty() || m.fqmn.starts_with(&format!("{}.", fqcn)))
+        .filter(|m| match_member_arity(m, arg_count))
         .collect();
 
+    tracing::debug!(
+        "member resolution for {}.{}: arg_count={}, fqcn_resolved={:?}, candidates={}",
+        qualifier,
+        get_node_text(node, rope),
+        arg_count,
+        qualifier_fqcn,
+        candidates.len()
+    );
+
     if candidates.is_empty() {
+        // Fallback: use any member with the same name (best-effort)
+        let mut fallback: Vec<_> = members.iter().collect();
+        fallback.sort_by_key(|m| {
+            (
+                m.is_varargs,
+                priority_for_uri(&m.uri, &m.fqmn),
+                m.param_count,
+            )
+        });
+        tracing::debug!(
+            "member resolution fallback for {}: arg_count={}, candidates={}",
+            qualifier,
+            arg_count,
+            fallback.len()
+        );
+        return fallback
+            .first()
+            .map(|m| Location::new(m.uri.clone(), m.range));
+    }
+
+    let mut scored: Vec<_> = candidates
+        .into_iter()
+        .filter_map(|m| {
+            score_member(m, call_args, rope, index, current_uri).map(|score| (m, score))
+        })
+        .collect();
+
+    if scored.is_empty() {
+        tracing::debug!(
+            "member resolution scoring produced no candidates for {}.{}",
+            qualifier,
+            get_node_text(node, rope)
+        );
         return None;
     }
 
-    candidates.sort_by_key(|m| {
-        if m.uri.scheme() == "file" || m.uri.scheme() == "untitled" {
-            0
-        } else if m.fqmn.starts_with("java.") {
-            1
-        } else {
-            2
-        }
+    scored.sort_by_key(|(m, score)| {
+        (
+            m.is_varargs,
+            -score,
+            (m.param_count as isize - arg_count as isize).abs(),
+            priority_for_uri(&m.uri, &m.fqmn),
+        )
     });
 
-    let member = candidates[0];
+    let member = scored[0].0;
     Some(Location::new(member.uri.clone(), member.range))
 }
 
+fn score_member(
+    member: &state::MemberLocation,
+    call_args: &[Node],
+    rope: &Rope,
+    index: &GlobalIndex,
+    current_uri: &str,
+) -> Option<i32> {
+    let mut total = 0;
+    if member.param_types.is_empty() {
+        return Some(0);
+    }
+
+    let solver = TypeSolver::new(rope, index, current_uri);
+
+    for (i, arg) in call_args.iter().enumerate() {
+        let param_idx = if member.is_varargs && i >= member.param_types.len() {
+            member.param_types.len().saturating_sub(1)
+        } else {
+            i
+        };
+        if param_idx >= member.param_types.len() {
+            return None;
+        }
+        let arg_type = solver.infer(*arg);
+        let param_type = &member.param_types[param_idx];
+        let score = calculate_score(&arg_type, param_type);
+        if score < 0 {
+            tracing::debug!(
+                "reject member {} due to type mismatch: arg={:?} param={:?} score={}",
+                member.fqmn,
+                arg_type,
+                param_type,
+                score
+            );
+            return None;
+        }
+        total += score;
+    }
+
+    tracing::debug!(
+        "score member {} with args {} => {}",
+        member.fqmn,
+        call_args.len(),
+        total
+    );
+    Some(total)
+}
+
+fn priority_for_uri(uri: &lsp_types::Url, fqmn: &str) -> i32 {
+    if uri.scheme() == "file" || uri.scheme() == "untitled" {
+        0
+    } else if fqmn.starts_with("java.") {
+        1
+    } else {
+        2
+    }
+}
+
+fn count_args(node: Node) -> usize {
+    if let Some(parent) = node.parent() {
+        if parent.kind() == "method_invocation" {
+            let mut cursor = parent.walk();
+            let args: Vec<_> = parent
+                .children_by_field_name("arguments", &mut cursor)
+                .flat_map(|arglist| {
+                    let mut inner = arglist.walk();
+                    arglist
+                        .children(&mut inner)
+                        .filter(|n| n.kind() != "," && n.is_named())
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            return args.len();
+        }
+    }
+    0
+}
+
+fn match_member_arity(member: &state::MemberLocation, arg_count: usize) -> bool {
+    if member.is_varargs {
+        arg_count >= member.param_count.saturating_sub(1)
+    } else {
+        arg_count == member.param_count
+    }
+}
 fn resolve_qualifier(node: Node, rope: &Rope) -> Option<String> {
     // Handles both field_access (System.out) and method_invocation (obj.method())
     if let Some(parent) = node.parent() {
@@ -224,9 +356,11 @@ fn resolve_qualifier_fqcn(
     class_candidates: &[state::ClassLocation],
     file_info: &state::FileInfo,
 ) -> Option<String> {
-    // If qualifier already looks qualified, use it directly
+    // If qualifier looks qualified (chained access), try the first segment as the type name.
     if qualifier.contains('.') {
-        return Some(qualifier.to_string());
+        if let Some(first) = qualifier.split('.').next() {
+            return resolve_qualifier_fqcn(first, class_candidates, file_info);
+        }
     }
 
     // Try imports first

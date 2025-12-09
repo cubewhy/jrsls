@@ -25,6 +25,9 @@ pub struct MemberLocation {
     pub fqmn: String,
     pub uri: lsp_types::Url,
     pub range: lsp_types::Range,
+    pub param_count: usize,
+    pub is_varargs: bool,
+    pub param_types: Vec<crate::ast::InferredType>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -41,6 +44,9 @@ pub struct IndexedMember {
     pub fqmn: String,
     pub uri: lsp_types::Url,
     pub range: lsp_types::Range,
+    pub param_count: usize,
+    pub is_varargs: bool,
+    pub param_types: Vec<crate::ast::InferredType>,
 }
 
 #[salsa::input]
@@ -163,6 +169,9 @@ impl GlobalIndex {
                         fqmn: member.fqmn.clone(),
                         uri: member.uri.clone(),
                         range: member.range,
+                        param_count: member.param_count,
+                        is_varargs: member.is_varargs,
+                        param_types: member.param_types.clone(),
                     })
             })
             .collect()
