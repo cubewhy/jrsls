@@ -136,6 +136,7 @@ fn collect_members(
                     param_count,
                     is_varargs,
                     param_types,
+                    is_field: false,
                 });
             }
         } else if child.kind() == "field_declaration" {
@@ -154,6 +155,7 @@ fn collect_members(
                         param_count: 0,
                         is_varargs: false,
                         param_types: Vec::new(),
+                        is_field: true,
                     });
                 }
             }

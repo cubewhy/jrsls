@@ -63,10 +63,6 @@ impl LanguageService for JavaService {
             return select_fallback(global_candidates);
         };
 
-        if let Some(loc) = match_same_file(&global_candidates, current_uri) {
-            return Some(Location::new(loc.uri, loc.range));
-        }
-
         if let Some(loc) =
             match_imported_symbol(&global_candidates, &file_info.imports, &target_name)
         {
@@ -79,6 +75,10 @@ impl LanguageService for JavaService {
             return Some(Location::new(loc.uri, loc.range));
         }
 
+        if let Some(loc) = match_same_file(&global_candidates, current_uri) {
+            return Some(Location::new(loc.uri, loc.range));
+        }
+
         if let Some(loc) = match_member(
             node,
             rope,
@@ -88,6 +88,8 @@ impl LanguageService for JavaService {
             qualifier.as_deref(),
             &call_args,
             current_uri,
+            node.parent()
+                .is_some_and(|p| p.kind() == "method_invocation"),
         ) {
             return Some(loc);
         }
@@ -173,6 +175,7 @@ fn match_member(
     qualifier: Option<&str>,
     call_args: &[Node],
     current_uri: &str,
+    prefer_method_usage_hint: bool,
 ) -> Option<Location> {
     // Attempt to use the qualifier's type to narrow down the member
     let qualifier = qualifier
@@ -183,20 +186,27 @@ fn match_member(
     let qualifier_fqcn = resolve_qualifier_fqcn(&qualifier, &qualifier_candidates, file_info);
     let fqcn = qualifier_fqcn.clone().unwrap_or_default();
     let arg_count = count_args(node);
+    let prefer_method_usage = has_ancestor_kind(node, "method_invocation")
+        || prefer_method_usage_hint
+        || is_followed_by_paren(node, rope);
+    let prefer_field_usage = !prefer_method_usage && call_args.is_empty();
 
     let candidates: Vec<_> = members
         .iter()
         .filter(|m| fqcn.is_empty() || m.fqmn.starts_with(&format!("{}.", fqcn)))
+        .filter(|m| !prefer_method_usage || !m.is_field)
         .filter(|m| match_member_arity(m, arg_count))
         .collect();
 
     tracing::debug!(
-        "member resolution for {}.{}: arg_count={}, fqcn_resolved={:?}, candidates={}",
+        "member resolution for {}.{}: arg_count={}, fqcn_resolved={:?}, candidates={}, prefer_method={}, prefer_field={}",
         qualifier,
         get_node_text(node, rope),
         arg_count,
         qualifier_fqcn,
-        candidates.len()
+        candidates.len(),
+        prefer_method_usage,
+        prefer_field_usage
     );
 
     if candidates.is_empty() {
@@ -238,6 +248,8 @@ fn match_member(
 
     scored.sort_by_key(|(m, score)| {
         (
+            prefer_field_usage.then(|| !m.is_field).unwrap_or(false),
+            prefer_method_usage.then(|| m.is_field).unwrap_or(false),
             m.is_varargs,
             -score,
             (m.param_count as isize - arg_count as isize).abs(),
@@ -325,6 +337,29 @@ fn count_args(node: Node) -> usize {
         }
     }
     0
+}
+
+fn has_ancestor_kind(node: Node, kind: &str) -> bool {
+    let mut curr = Some(node);
+    while let Some(n) = curr {
+        if n.kind() == kind {
+            return true;
+        }
+        curr = n.parent();
+    }
+    false
+}
+
+fn is_followed_by_paren(node: Node, rope: &Rope) -> bool {
+    let end_char = rope.byte_to_char(node.end_byte());
+    let mut iter = rope.chars_at(end_char);
+    while let Some(ch) = iter.next() {
+        if ch.is_whitespace() {
+            continue;
+        }
+        return ch == '(';
+    }
+    false
 }
 
 fn match_member_arity(member: &state::MemberLocation, arg_count: usize) -> bool {

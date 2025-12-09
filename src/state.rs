@@ -28,6 +28,7 @@ pub struct MemberLocation {
     pub param_count: usize,
     pub is_varargs: bool,
     pub param_types: Vec<crate::ast::InferredType>,
+    pub is_field: bool,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -47,6 +48,7 @@ pub struct IndexedMember {
     pub param_count: usize,
     pub is_varargs: bool,
     pub param_types: Vec<crate::ast::InferredType>,
+    pub is_field: bool,
 }
 
 #[salsa::input]
@@ -172,6 +174,7 @@ impl GlobalIndex {
                         param_count: member.param_count,
                         is_varargs: member.is_varargs,
                         param_types: member.param_types.clone(),
+                        is_field: member.is_field,
                     })
             })
             .collect()

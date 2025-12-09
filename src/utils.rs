@@ -72,7 +72,15 @@ pub fn find_definition_in_file(
 
         if kind == "class_declaration"
             && let Some(body) = parent.child_by_field_name("body")
-            && let Some(range) = search_class_member(body, target_name, rope, call_args, index, uri)
+            && let Some(range) = search_class_member(
+                body,
+                target_name,
+                rope,
+                call_args,
+                index,
+                uri,
+                prefer_field_first(start_node),
+            )
         {
             return Some(range);
         }
@@ -81,6 +89,18 @@ pub fn find_definition_in_file(
     }
 
     None
+}
+
+fn prefer_field_first(node: Node) -> bool {
+    // When there are no call arguments and we are not in a method_invocation,
+    // prefer fields over methods with the same name.
+    if node
+        .parent()
+        .is_some_and(|p| p.kind() == "method_invocation")
+    {
+        return false;
+    }
+    true
 }
 
 pub fn search_scope(scope_node: Node, target_name: &str, rope: &Rope) -> Option<Range> {
@@ -164,6 +184,7 @@ fn search_class_member(
     call_args: &[Node],
     index: &GlobalIndex,
     uri: &str,
+    prefer_field: bool,
 ) -> Option<Range> {
     let mut cursor = class_body.walk();
 
@@ -171,6 +192,12 @@ fn search_class_member(
     let mut max_score = -9999;
 
     for child in class_body.children(&mut cursor) {
+        if prefer_field {
+            if let Some(range) = find_field_in_declaration(child, target_name, rope) {
+                return Some(range);
+            }
+        }
+
         if child.kind() == "method_declaration" {
             let name_node = child.child_by_field_name("name")?;
             if get_node_text(name_node, rope) != target_name {
@@ -244,7 +271,30 @@ fn search_class_member(
                 );
             }
         }
+
+        if !prefer_field {
+            if let Some(range) = find_field_in_declaration(child, target_name, rope) {
+                return Some(range);
+            }
+        }
     }
 
     best_candidate
+}
+
+fn find_field_in_declaration(node: Node, target_name: &str, rope: &Rope) -> Option<Range> {
+    if node.kind() != "field_declaration" {
+        return None;
+    }
+    let mut sub_cursor = node.walk();
+
+    for sub in node.children(&mut sub_cursor) {
+        if sub.kind() == "variable_declarator"
+            && let Some(name_node) = sub.child_by_field_name("name")
+            && get_node_text(name_node, rope) == target_name
+        {
+            return Some(node_range(name_node, rope));
+        }
+    }
+    None
 }
