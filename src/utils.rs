@@ -1,3 +1,4 @@
+use crate::ast::get_method_def_param_count;
 use ropey::Rope;
 use tower_lsp::lsp_types::{Position, Range};
 use tree_sitter::Node;
@@ -38,31 +39,36 @@ pub fn get_node_at_pos<'a>(
     Some((node, name))
 }
 
-pub fn find_definition_in_file(start_node: Node, target_name: &str, rope: &Rope) -> Option<Range> {
+pub fn find_definition_in_file(
+    start_node: Node,
+    target_name: &str,
+    rope: &Rope,
+    expected_argc: Option<usize>,
+) -> Option<Range> {
     let mut curr = start_node;
 
     while let Some(parent) = curr.parent() {
         let kind = parent.kind();
 
         if kind == "method_declaration" {
-            if let Some(params) = parent.child_by_field_name("parameters") {
-                if let Some(range) = search_scope(params, target_name, rope) {
-                    return Some(range);
-                }
+            if let Some(params) = parent.child_by_field_name("parameters")
+                && let Some(range) = search_scope(params, target_name, rope)
+            {
+                return Some(range);
             }
-            if let Some(body) = parent.child_by_field_name("body") {
-                if let Some(range) = search_scope(body, target_name, rope) {
-                    return Some(range);
-                }
+
+            if let Some(body) = parent.child_by_field_name("body")
+                && let Some(range) = search_scope(body, target_name, rope)
+            {
+                return Some(range);
             }
         }
 
-        if kind == "class_declaration" {
-            if let Some(body) = parent.child_by_field_name("body") {
-                if let Some(range) = search_fields_in_class(body, target_name, rope) {
-                    return Some(range);
-                }
-            }
+        if kind == "class_declaration"
+            && let Some(body) = parent.child_by_field_name("body")
+            && let Some(range) = search_class_member(body, target_name, rope, expected_argc)
+        {
+            return Some(range);
         }
 
         curr = parent;
@@ -78,12 +84,11 @@ pub fn search_scope(scope_node: Node, target_name: &str, rope: &Rope) -> Option<
         if child.kind() == "local_variable_declaration" {
             let mut sub_cursor = child.walk();
             for sub in child.children(&mut sub_cursor) {
-                if sub.kind() == "variable_declarator" {
-                    if let Some(name_node) = sub.child_by_field_name("name") {
-                        if get_node_text(name_node, rope) == target_name {
-                            return Some(node_range(name_node, rope));
-                        }
-                    }
+                if sub.kind() == "variable_declarator"
+                    && let Some(name_node) = sub.child_by_field_name("name")
+                    && get_node_text(name_node, rope) == target_name
+                {
+                    return Some(node_range(name_node, rope));
                 }
             }
         }
@@ -99,23 +104,58 @@ pub fn search_fields_in_class(class_body: Node, target_name: &str, rope: &Rope) 
             let mut sub_cursor = child.walk();
 
             for sub in child.children(&mut sub_cursor) {
-                if sub.kind() == "variable_declarator" {
-                    if let Some(name_node) = sub.child_by_field_name("name") {
-                        if get_node_text(name_node, rope) == target_name {
-                            return Some(node_range(name_node, rope));
-                        }
-                    }
-                }
-            }
-        }
-
-        if child.kind() == "method_declaration" {
-            if let Some(name_node) = child.child_by_field_name("name") {
-                if get_node_text(name_node, rope) == target_name {
+                if sub.kind() == "variable_declarator"
+                    && let Some(name_node) = sub.child_by_field_name("name")
+                    && get_node_text(name_node, rope) == target_name
+                {
                     return Some(node_range(name_node, rope));
                 }
             }
         }
+
+        if child.kind() == "method_declaration"
+            && let Some(name_node) = child.child_by_field_name("name")
+            && get_node_text(name_node, rope) == target_name
+        {
+            return Some(node_range(name_node, rope));
+        }
     }
+    None
+}
+
+fn search_class_member(
+    class_body: Node,
+    target_name: &str,
+    rope: &Rope,
+    expected_argc: Option<usize>,
+) -> Option<Range> {
+    let mut cursor = class_body.walk();
+
+    for child in class_body.children(&mut cursor) {
+        // fields
+        if child.kind() == "field_declaration" {
+            return search_fields_in_class(class_body, target_name, rope);
+        }
+
+        // methods
+        if child.kind() == "method_declaration"
+            && let Some(name_node) = child.child_by_field_name("name")
+            && get_node_text(name_node, rope) == target_name
+        {
+            // check param count
+            let def_argc = get_method_def_param_count(child);
+
+            if let Some(req) = expected_argc
+                && let Some(def) = def_argc
+            {
+                if req == def {
+                    return Some(node_range(name_node, rope));
+                }
+            } else {
+                return Some(node_range(name_node, rope));
+            }
+        }
+    }
+
     None
 }

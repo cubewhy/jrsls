@@ -10,9 +10,15 @@ pub struct FileInfo {
     pub defined_classes: Vec<String>,
 }
 
-pub struct GlobalIndex {
-    pub short_name_map: DashMap<String, Vec<(String, lsp_types::Url)>>,
+#[derive(Debug, Clone)]
+pub struct ClassLocation {
+    pub fqcn: String,
+    pub uri: lsp_types::Url,
+    pub range: lsp_types::Range,
+}
 
+pub struct GlobalIndex {
+    pub short_name_map: DashMap<String, Vec<ClassLocation>>,
     pub file_info: DashMap<String, FileInfo>,
 }
 
@@ -22,6 +28,12 @@ impl GlobalIndex {
             short_name_map: DashMap::new(),
             file_info: DashMap::new(),
         }
+    }
+}
+
+impl Default for GlobalIndex {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

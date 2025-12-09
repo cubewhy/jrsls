@@ -45,7 +45,7 @@ impl LspBackend {
     }
 
     fn get_ext(&self, uri: &str) -> Option<String> {
-        uri.split('.').last().map(|s| s.to_string())
+        uri.split('.').next_back().map(|s| s.to_string())
     }
 }
 

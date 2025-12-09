@@ -1,5 +1,5 @@
-use crate::state::FileInfo;
-use crate::utils::get_node_text;
+use crate::state::{ClassLocation, FileInfo};
+use crate::utils::{get_node_text, node_range};
 use ropey::Rope;
 use tower_lsp::lsp_types;
 use tree_sitter::StreamingIterator;
@@ -45,7 +45,6 @@ impl Indexer {
             let capture = m.captures[capture_index];
             let node = capture.node;
 
-            // 我们依然需要 rope 来获取文本
             let text = get_node_text(node, rope);
 
             let query_capture_idx = capture.index as usize;
@@ -63,11 +62,15 @@ impl Indexer {
                         text.clone()
                     };
 
-                    index
-                        .short_name_map
-                        .entry(text)
-                        .or_default()
-                        .push((fqcn, url.clone()));
+                    let range = node_range(node, rope);
+
+                    let location = ClassLocation {
+                        fqcn,
+                        uri: url.clone(),
+                        range,
+                    };
+
+                    index.short_name_map.entry(text).or_default().push(location);
                 }
                 _ => {}
             }
