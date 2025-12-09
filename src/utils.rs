@@ -1,5 +1,5 @@
 use crate::{
-    ast::{InferredType, infer_expr_type, parse_java_type},
+    ast::{InferredType, parse_java_type},
     inference::TypeSolver,
     state::GlobalIndex,
 };

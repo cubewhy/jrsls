@@ -1,7 +1,7 @@
 use super::LanguageService;
 use crate::{
     ast::get_call_args,
-    state::GlobalIndex,
+    state::{self, GlobalIndex},
     utils::{find_definition_in_file, get_node_at_pos, get_node_text, node_range},
 };
 use ropey::Rope;
@@ -40,6 +40,7 @@ impl LanguageService for JavaService {
         if node.kind() != "identifier" && node.kind() != "type_identifier" {
             return None;
         }
+        let global_candidates = index.classes_by_short_name(&target_name);
 
         if let Some(range) =
             find_definition_in_file(node, &target_name, rope, &call_args, index, current_uri)
@@ -50,46 +51,65 @@ impl LanguageService for JavaService {
             ));
         }
 
-        // TODO: overload support for global index
+        let Some(file_info) = index.file_info(current_uri) else {
+            return select_fallback(global_candidates);
+        };
 
-        if let Some(file_info) = index.file_info.get(current_uri) {
-            // match import
-            for import in &file_info.imports {
-                if import.ends_with(&format!(".{}", target_name))
-                    && let Some(candidates) = index.short_name_map.get(&target_name)
-                {
-                    for loc in candidates.value() {
-                        if &loc.fqcn == import {
-                            return Some(Location::new(loc.uri.clone(), loc.range));
-                        }
-                    }
-                }
-            }
-
-            // match same package
-            if let Some(pkg) = &file_info.package_name {
-                let potential_fqcn = format!("{}.{}", pkg, target_name);
-                if let Some(candidates) = index.short_name_map.get(&target_name) {
-                    for loc in candidates.value() {
-                        if loc.fqcn == potential_fqcn {
-                            return Some(Location::new(loc.uri.clone(), loc.range));
-                        }
-                    }
-                }
-            }
-        }
-
-        // match short name
-        if let Some(candidates) = index.short_name_map.get(&target_name)
-            && let Some(loc) = candidates.first()
+        if let Some(loc) =
+            match_imported_symbol(&global_candidates, &file_info.imports, &target_name)
         {
-            // 这里其实可以做的更好：如果是 java.lang 的类优先返回，否则返回第一个
-            // 目前逻辑：直接跳到第一个同名类的定义处
-            return Some(Location::new(loc.uri.clone(), loc.range));
+            return Some(Location::new(loc.uri, loc.range));
         }
 
-        None
+        if let Some(pkg) = &file_info.package_name {
+            if let Some(loc) = match_same_package(&global_candidates, pkg, &target_name) {
+                return Some(Location::new(loc.uri, loc.range));
+            }
+        }
+
+        select_fallback(global_candidates)
     }
+}
+
+fn match_imported_symbol(
+    candidates: &[state::ClassLocation],
+    imports: &[String],
+    target_name: &str,
+) -> Option<state::ClassLocation> {
+    for import in imports {
+        if import.ends_with(&format!(".{}", target_name)) {
+            if let Some(loc) = candidates.iter().find(|loc| &loc.fqcn == import) {
+                return Some(loc.clone());
+            }
+        }
+    }
+    None
+}
+
+fn match_same_package(
+    candidates: &[state::ClassLocation],
+    package_name: &str,
+    target_name: &str,
+) -> Option<state::ClassLocation> {
+    let potential_fqcn = format!("{}.{}", package_name, target_name);
+    candidates
+        .iter()
+        .find(|loc| loc.fqcn == potential_fqcn)
+        .cloned()
+}
+
+fn select_fallback(candidates: Vec<state::ClassLocation>) -> Option<Location> {
+    if candidates.is_empty() {
+        return None;
+    }
+    if let Some(java_lang) = candidates
+        .iter()
+        .find(|loc| loc.fqcn.starts_with("java.lang."))
+    {
+        return Some(Location::new(java_lang.uri.clone(), java_lang.range));
+    }
+    let loc = &candidates[0];
+    Some(Location::new(loc.uri.clone(), loc.range))
 }
 
 fn traverse_node(node: Node, rope: &Rope) -> Vec<DocumentSymbol> {

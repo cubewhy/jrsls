@@ -22,3 +22,4 @@ streaming-iterator = "0.1"
 salsa = { version = "0.24.0", features = ["macros"] }
 ropey = "1.6.1"
 dashmap = "6.1.0"
+clap = { version = "4.5.19", features = ["derive"] }

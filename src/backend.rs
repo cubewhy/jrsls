@@ -1,10 +1,12 @@
+use crate::filesystem::collect_files_with_ext;
 use crate::indexer::Indexer;
 use crate::lang::{LanguageService, java::JavaService};
 use crate::state::{Document, GlobalIndex};
 use dashmap::DashMap;
 use ropey::Rope;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
 use tokio::sync::Mutex;
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
@@ -17,6 +19,7 @@ pub struct LspBackend {
     pub index: Arc<GlobalIndex>,
     services: HashMap<String, Box<dyn LanguageService>>,
     parsers: DashMap<String, Mutex<tree_sitter::Parser>>,
+    workspace_root: RwLock<Option<PathBuf>>,
 }
 
 impl LspBackend {
@@ -41,17 +44,99 @@ impl LspBackend {
             index: Arc::new(GlobalIndex::new()),
             services,
             parsers,
+            workspace_root: RwLock::new(None),
         }
     }
 
     fn get_ext(&self, uri: &str) -> Option<String> {
         uri.split('.').next_back().map(|s| s.to_string())
     }
+
+    async fn index_workspace(&self) {
+        let root = match self.workspace_root.read() {
+            Ok(guard) => guard.clone(),
+            Err(_) => None,
+        };
+
+        let Some(root) = root else {
+            tracing::info!("Skip workspace indexing: no root provided by client");
+            return;
+        };
+
+        let java_files =
+            match tokio::task::spawn_blocking(move || collect_files_with_ext(root, "java")).await {
+                Ok(list) => list,
+                Err(err) => {
+                    tracing::error!("Failed to collect files for indexing: {err}");
+                    return;
+                }
+            };
+
+        if java_files.is_empty() {
+            tracing::info!("No Java files found during workspace indexing");
+            return;
+        }
+
+        tracing::info!("Indexing {} Java files...", java_files.len());
+        for path in java_files {
+            if let Err(err) = self.index_single_file(&path).await {
+                tracing::warn!("Indexing failed for {:?}: {}", path, err);
+            }
+        }
+        tracing::info!("Workspace indexing finished");
+    }
+
+    async fn index_single_file(&self, path: &std::path::Path) -> anyhow::Result<()> {
+        let ext = path
+            .extension()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| anyhow::anyhow!("Missing extension"))?;
+        if !self.services.contains_key(ext) {
+            return Ok(());
+        }
+
+        let uri = Url::from_file_path(path)
+            .map_err(|_| anyhow::anyhow!("Invalid file path for URL: {:?}", path))?;
+        let text = std::fs::read_to_string(path)?;
+        let rope = Rope::from_str(&text);
+
+        let parser_lock = self
+            .parsers
+            .get(ext)
+            .ok_or_else(|| anyhow::anyhow!("No parser registered for extension '{}'", ext))?;
+        let mut parser = parser_lock.lock().await;
+        let tree = parser
+            .parse_with_options(
+                &mut |offset, _| rope.byte_slice(offset..).chunks().next().unwrap_or(""),
+                None,
+                None,
+            )
+            .ok_or_else(|| anyhow::anyhow!("Failed to parse file {:?}", path))?;
+
+        Indexer::update_file(&self.index, &uri.to_string(), &tree, &rope);
+        Ok(())
+    }
 }
 
 #[tower_lsp::async_trait]
 impl LanguageServer for LspBackend {
-    async fn initialize(&self, _: InitializeParams) -> Result<InitializeResult> {
+    async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
+        if let Some(root) = params
+            .root_uri
+            .and_then(|u| u.to_file_path().ok())
+            .or_else(|| {
+                params
+                    .workspace_folders
+                    .as_ref()
+                    .and_then(|folders| folders.first())
+                    .and_then(|folder| folder.uri.to_file_path().ok())
+            })
+        {
+            if let Ok(mut guard) = self.workspace_root.write() {
+                *guard = Some(root);
+            }
+        }
+
         tracing::info!("Lsp Initialzed");
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
@@ -71,6 +156,7 @@ impl LanguageServer for LspBackend {
         self.client
             .log_message(MessageType::INFO, "Server initialized!")
             .await;
+        self.index_workspace().await;
     }
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
@@ -98,7 +184,11 @@ impl LanguageServer for LspBackend {
             .unwrap();
 
         tracing::info!("Parsed file {}", uri);
-        self.documents.insert(uri, Document { text: rope, tree });
+        self.documents
+            .insert(uri.clone(), Document { text: rope, tree });
+        if let Some(doc) = self.documents.get(&uri) {
+            Indexer::update_file(&self.index, &uri, &doc.tree, &doc.text);
+        }
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {

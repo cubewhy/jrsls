@@ -1,5 +1,4 @@
 use crate::ast::{InferredType, parse_java_type};
-use crate::lang::java::JavaService;
 use crate::state::GlobalIndex;
 use crate::utils::get_node_text;
 use ropey::Rope;

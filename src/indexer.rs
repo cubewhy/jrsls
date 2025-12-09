@@ -1,4 +1,4 @@
-use crate::state::{ClassLocation, FileInfo};
+use crate::state::IndexedClass;
 use crate::utils::{get_node_text, node_range};
 use ropey::Rope;
 use tower_lsp::lsp_types;
@@ -33,6 +33,7 @@ impl Indexer {
         let mut package_name = None;
         let mut imports = Vec::new();
         let mut defined_classes = Vec::new();
+        let mut indexed_classes = Vec::new();
 
         let url = match lsp_types::Url::parse(uri) {
             Ok(u) => u,
@@ -56,34 +57,23 @@ impl Indexer {
                 "class" | "interface" | "enum" | "record" => {
                     defined_classes.push(text.clone());
 
-                    let fqcn = if let Some(pkg) = &package_name {
-                        format!("{}.{}", pkg, text)
-                    } else {
-                        text.clone()
-                    };
+                    let fqcn = package_name
+                        .as_ref()
+                        .map(|pkg| format!("{}.{}", pkg, text))
+                        .unwrap_or(text.clone());
 
-                    let range = node_range(node, rope);
-
-                    let location = ClassLocation {
+                    indexed_classes.push(IndexedClass {
+                        short_name: text,
                         fqcn,
                         uri: url.clone(),
-                        range,
-                    };
-
-                    index.short_name_map.entry(text).or_default().push(location);
+                        range: node_range(node, rope),
+                    });
                 }
                 _ => {}
             }
         }
 
-        index.file_info.insert(
-            uri.to_string(),
-            FileInfo {
-                package_name,
-                imports,
-                defined_classes: defined_classes.clone(),
-            },
-        );
+        index.upsert_file(uri, package_name, imports, indexed_classes);
 
         tracing::debug!("Indexed {}: classes={:?}", uri, defined_classes);
     }

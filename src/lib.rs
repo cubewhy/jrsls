@@ -1,5 +1,6 @@
 pub mod ast;
 pub mod backend;
+pub mod filesystem;
 pub mod indexer;
 pub mod inference;
 pub mod lang;
