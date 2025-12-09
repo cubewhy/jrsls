@@ -17,6 +17,7 @@ lazy_static::lazy_static! {
         (interface_declaration name: (identifier) @interface)
         (enum_declaration name: (identifier) @enum)
         (record_declaration name: (identifier) @record)
+        (annotation_type_declaration name: (identifier) @annotation)
         "#
     ).unwrap();
 }
@@ -55,7 +56,7 @@ impl Indexer {
             match capture_name {
                 "package" => package_name = Some(text),
                 "import" => imports.push(text),
-                "class" | "interface" | "enum" | "record" => {
+                "class" | "interface" | "enum" | "record" | "annotation" => {
                     defined_classes.push(text.clone());
 
                     let fqcn = package_name
