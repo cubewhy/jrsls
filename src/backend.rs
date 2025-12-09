@@ -15,6 +15,11 @@ use tower_lsp::{Client, LanguageServer};
 use tree_sitter::{InputEdit, Point};
 use zip::ZipArchive;
 
+#[derive(Clone)]
+pub struct ServerConfig {
+    pub keywords: Vec<String>,
+}
+
 pub struct LspBackend {
     pub client: Client,
     pub documents: DashMap<String, Document>,
@@ -23,10 +28,11 @@ pub struct LspBackend {
     parsers: DashMap<String, Mutex<tree_sitter::Parser>>,
     workspace_root: RwLock<Option<PathBuf>>,
     source_archives: Arc<SourceArchiveRegistry>,
+    config: ServerConfig,
 }
 
 impl LspBackend {
-    pub fn new(client: Client) -> Self {
+    pub fn new(client: Client, config: ServerConfig) -> Self {
         let mut services: HashMap<String, Box<dyn LanguageService>> = HashMap::new();
 
         // TODO: register kotlin service, gradle service
@@ -49,6 +55,7 @@ impl LspBackend {
             parsers,
             workspace_root: RwLock::new(None),
             source_archives: Arc::new(SourceArchiveRegistry::new()),
+            config,
         }
     }
 
@@ -221,7 +228,11 @@ impl LanguageServer for LspBackend {
                 )),
                 definition_provider: Some(OneOf::Left(true)),
                 document_symbol_provider: Some(OneOf::Left(true)),
-                // completion_provider: Some(CompletionOptions::default()),
+                completion_provider: Some(CompletionOptions {
+                    resolve_provider: Some(false),
+                    trigger_characters: Some(vec![".".to_string()]),
+                    ..Default::default()
+                }),
                 ..Default::default()
             },
             ..Default::default()
@@ -404,5 +415,31 @@ impl LanguageServer for LspBackend {
 
     async fn shutdown(&self) -> Result<()> {
         Ok(())
+    }
+
+    async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
+        let uri = params.text_document_position.text_document.uri.to_string();
+        let position = params.text_document_position.position;
+        let ext = match self.get_ext(&uri) {
+            Some(e) => e,
+            None => return Ok(None),
+        };
+
+        if let Some(doc) = self.documents.get(&uri)
+            && let Some(service) = self.services.get(&ext)
+        {
+            if let Some(items) = service.completion(
+                &doc.tree,
+                &doc.text,
+                position,
+                &self.index,
+                &uri,
+                &self.config.keywords,
+            ) {
+                return Ok(Some(CompletionResponse::Array(items)));
+            }
+        }
+
+        Ok(None)
     }
 }

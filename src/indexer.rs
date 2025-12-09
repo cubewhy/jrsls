@@ -137,10 +137,14 @@ fn collect_members(
                     is_varargs,
                     param_types,
                     is_field: false,
+                    field_type: None,
                 });
             }
         } else if child.kind() == "field_declaration" {
             let mut sub_cursor = child.walk();
+            let field_type = child
+                .child_by_field_name("type")
+                .map(|t| parse_java_type(t, rope));
             for sub in child.children(&mut sub_cursor) {
                 if sub.kind() == "variable_declarator"
                     && let Some(name_node) = sub.child_by_field_name("name")
@@ -156,6 +160,7 @@ fn collect_members(
                         is_varargs: false,
                         param_types: Vec::new(),
                         is_field: true,
+                        field_type: field_type.clone(),
                     });
                 }
             }

@@ -6,7 +6,10 @@ use crate::{
     utils::{calculate_score, find_definition_in_file, get_node_at_pos, get_node_text, node_range},
 };
 use ropey::Rope;
-use tower_lsp::lsp_types::{self, DocumentSymbol, Location, Position, SymbolKind};
+use std::collections::HashSet;
+use tower_lsp::lsp_types::{
+    self, CompletionItem, CompletionItemKind, DocumentSymbol, Location, Position, SymbolKind,
+};
 use tree_sitter::{Node, Tree};
 
 pub struct JavaService;
@@ -18,6 +21,139 @@ impl LanguageService for JavaService {
 
     fn document_symbol(&self, tree: &Tree, rope: &Rope) -> Vec<DocumentSymbol> {
         traverse_node(tree.root_node(), rope)
+    }
+
+    fn completion(
+        &self,
+        tree: &Tree,
+        rope: &Rope,
+        position: Position,
+        index: &GlobalIndex,
+        current_uri: &str,
+        keywords: &[String],
+    ) -> Option<Vec<CompletionItem>> {
+        let byte_idx = offset_for_position(rope, position)?;
+        let prev_char = byte_before(rope, byte_idx);
+
+        if let Some(ctx) = member_completion_context(tree, rope, position, prev_char) {
+            let file_info = index.file_info(current_uri)?;
+            let qualifier_fqcn =
+                resolve_qualifier_for_completion(&ctx.qualifier, index, &file_info)?;
+
+            let members = index.members_of_class(&qualifier_fqcn);
+            let mut seen = HashSet::new();
+            let items = members
+                .into_iter()
+                .filter(|m| seen.insert(m.fqmn.clone()))
+                .filter(|m| {
+                    m.fqmn
+                        .split('.')
+                        .last()
+                        .map(|name| name.starts_with(&ctx.prefix))
+                        .unwrap_or(true)
+                })
+                .map(|m| CompletionItem {
+                    label: m
+                        .fqmn
+                        .split('.')
+                        .last()
+                        .unwrap_or_else(|| m.fqmn.as_str())
+                        .to_string(),
+                    kind: Some(if m.is_field {
+                        CompletionItemKind::FIELD
+                    } else {
+                        CompletionItemKind::METHOD
+                    }),
+                    detail: Some(qualifier_fqcn.clone()),
+                    ..CompletionItem::default()
+                })
+                .collect::<Vec<_>>();
+
+            tracing::debug!(
+                "completion: qualifier={} fqcn={} prefix='{}' items={}",
+                ctx.qualifier,
+                qualifier_fqcn,
+                ctx.prefix,
+                items.len()
+            );
+            return Some(items);
+        }
+
+        // Offer classes defined in the current file and imported types as a light baseline
+        let Some(file_info) = index.file_info(current_uri) else {
+            return None;
+        };
+
+        let mut items = Vec::new();
+        let mut seen = HashSet::new();
+
+        for class in &file_info.defined_classes {
+            if seen.insert(class.clone()) {
+                items.push(CompletionItem {
+                    label: class.clone(),
+                    kind: Some(CompletionItemKind::CLASS),
+                    ..CompletionItem::default()
+                });
+            }
+        }
+
+        for import in &file_info.imports {
+            if let Some(short) = import.split('.').last() {
+                if seen.insert(short.to_string()) {
+                    items.push(CompletionItem {
+                        label: short.to_string(),
+                        kind: Some(CompletionItemKind::CLASS),
+                        detail: Some(import.clone()),
+                        ..CompletionItem::default()
+                    });
+                }
+            }
+        }
+
+        // include java.lang common classes (String, System, Object) if available
+        for base in ["String", "System", "Object", "Exception", "Throwable"] {
+            if seen.contains(base) {
+                continue;
+            }
+            if let Some(loc) = index
+                .classes_by_short_name(base)
+                .into_iter()
+                .find(|c| c.fqcn.starts_with("java.lang."))
+            {
+                items.push(CompletionItem {
+                    label: base.to_string(),
+                    kind: Some(CompletionItemKind::CLASS),
+                    detail: Some(loc.fqcn),
+                    ..CompletionItem::default()
+                });
+                seen.insert(base.to_string());
+            }
+        }
+
+        if !prev_char.map(|c| c.is_alphanumeric()).unwrap_or(false) {
+            for kw in keywords {
+                items.push(CompletionItem {
+                    label: kw.clone(),
+                    kind: Some(CompletionItemKind::KEYWORD),
+                    ..CompletionItem::default()
+                });
+            }
+        }
+
+        // Only suggest keywords in free-form contexts (not mid-identifier and not after '.')
+        if prev_char.map(|c| c.is_alphanumeric()).unwrap_or(false) {
+            // skip keywords
+        } else {
+            for kw in keywords {
+                items.push(CompletionItem {
+                    label: kw.clone(),
+                    kind: Some(CompletionItemKind::KEYWORD),
+                    ..CompletionItem::default()
+                });
+            }
+        }
+
+        if items.is_empty() { None } else { Some(items) }
     }
 
     fn goto_definition(
@@ -383,6 +519,176 @@ fn match_member_arity(member: &state::MemberLocation, arg_count: usize) -> bool 
     } else {
         arg_count == member.param_count
     }
+}
+
+fn offset_for_position(rope: &Rope, position: Position) -> Option<usize> {
+    let line = position.line as usize;
+    if line >= rope.len_lines() {
+        return None;
+    }
+    let char_idx = rope.line_to_char(line) + position.character as usize;
+    Some(rope.char_to_byte(char_idx))
+}
+
+fn position_before(rope: &Rope, position: Position) -> Option<Position> {
+    if position.character > 0 {
+        return Some(Position::new(position.line, position.character - 1));
+    }
+    if position.line == 0 {
+        return None;
+    }
+    let prev_line = position.line - 1;
+    let prev_len = rope.line(prev_line as usize).len_chars() as u32;
+    Some(Position::new(prev_line, prev_len.saturating_sub(1)))
+}
+
+fn byte_before(rope: &Rope, byte_idx: usize) -> Option<char> {
+    if byte_idx == 0 {
+        return None;
+    }
+    let char_idx = rope.byte_to_char(byte_idx).checked_sub(1)?;
+    Some(rope.char(char_idx))
+}
+
+fn qualifier_at_dot(tree: &Tree, rope: &Rope, position: Position) -> Option<String> {
+    let lookup = position_before(rope, position)?;
+    let byte = offset_for_position(rope, lookup)?;
+    let node = tree.root_node().descendant_for_byte_range(byte, byte)?;
+    let target = if node.kind() == "identifier" || node.kind() == "type_identifier" {
+        node
+    } else {
+        node.parent()?
+    };
+    Some(get_node_text(target, rope))
+}
+
+fn resolve_qualifier_for_completion(
+    qualifier: &str,
+    index: &GlobalIndex,
+    file_info: &state::FileInfo,
+) -> Option<String> {
+    resolve_qualifier_chain(qualifier, index, file_info)
+}
+
+struct MemberContext {
+    qualifier: String,
+    prefix: String,
+}
+
+fn member_completion_context(
+    tree: &Tree,
+    rope: &Rope,
+    position: Position,
+    prev_char: Option<char>,
+) -> Option<MemberContext> {
+    // Directly after dot
+    if prev_char == Some('.') {
+        let qualifier = qualifier_at_dot(tree, rope, position)?;
+        return Some(MemberContext {
+            qualifier,
+            prefix: String::new(),
+        });
+    }
+
+    // If cursor is inside an identifier that is part of a field access or method invocation
+    let byte_idx = offset_for_position(rope, position)?;
+    let node = tree
+        .root_node()
+        .descendant_for_byte_range(byte_idx.saturating_sub(1), byte_idx.saturating_sub(1))?;
+
+    if node.kind() == "identifier" || node.kind() == "field_identifier" {
+        if let Some(parent) = node.parent() {
+            if parent.kind() == "field_access" {
+                let object = parent.child_by_field_name("object")?;
+                let qualifier = get_node_text(object, rope);
+                let prefix = slice_prefix(node, rope, position);
+                return Some(MemberContext { qualifier, prefix });
+            }
+        }
+    }
+
+    if node.kind() == "identifier" {
+        if let Some(parent) = node.parent() {
+            if parent.kind() == "method_invocation" {
+                if let Some(object) = parent.child_by_field_name("object") {
+                    let qualifier = get_node_text(object, rope);
+                    let prefix = slice_prefix(node, rope, position);
+                    return Some(MemberContext { qualifier, prefix });
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn slice_prefix(node: Node, rope: &Rope, position: Position) -> String {
+    let node_start = rope.byte_to_char(node.start_byte());
+    let caret_char = rope.line_to_char(position.line as usize) + position.character as usize;
+    if caret_char <= node_start {
+        return String::new();
+    }
+    let end = caret_char.min(rope.byte_to_char(node.end_byte()));
+    rope.slice(node_start..end).to_string()
+}
+
+fn resolve_class_from_name(
+    name: &str,
+    index: &GlobalIndex,
+    file_info: Option<&state::FileInfo>,
+) -> Option<String> {
+    let candidates = index.classes_by_short_name(name);
+    if candidates.is_empty() {
+        return None;
+    }
+
+    if let Some(info) = file_info {
+        if let Some(loc) = match_imported_symbol(&candidates, &info.imports, name) {
+            return Some(loc.fqcn);
+        }
+        if let Some(pkg) = &info.package_name {
+            if let Some(loc) = match_same_package(&candidates, pkg, name) {
+                return Some(loc.fqcn);
+            }
+        }
+    }
+
+    if let Some(loc) = match_java_lang(&candidates) {
+        return Some(loc.fqcn);
+    }
+
+    candidates.first().map(|c| c.fqcn.clone())
+}
+
+fn resolve_qualifier_chain(
+    qualifier: &str,
+    index: &GlobalIndex,
+    file_info: &state::FileInfo,
+) -> Option<String> {
+    let parts = qualifier.split('.').collect::<Vec<_>>();
+    if parts.is_empty() {
+        return None;
+    }
+
+    let mut current_fqcn = resolve_class_from_name(parts[0], index, Some(file_info))?;
+
+    for part in parts.iter().skip(1) {
+        let members = index.members_of_class(&current_fqcn);
+        let field = members
+            .iter()
+            .find(|m| m.is_field && m.fqmn.ends_with(&format!(".{}", part)));
+        let field_type = field.and_then(|f| f.field_type.clone());
+
+        let type_name = match field_type {
+            Some(crate::ast::InferredType::Class(name)) => name,
+            _ => return None,
+        };
+
+        current_fqcn =
+            resolve_class_from_name(&type_name, index, Some(file_info)).unwrap_or(type_name);
+    }
+
+    Some(current_fqcn)
 }
 fn resolve_qualifier(node: Node, rope: &Rope) -> Option<String> {
     // Handles both field_access (System.out) and method_invocation (obj.method())

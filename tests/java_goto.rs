@@ -3,7 +3,7 @@ use tower_lsp::lsp_types::{Location, Position, Url};
 
 use jrsls::{
     indexer::Indexer,
-    lang::{java::JavaService, LanguageService},
+    lang::{LanguageService, java::JavaService},
     state::GlobalIndex,
 };
 
@@ -200,7 +200,10 @@ class Main {
 
     let field_loc = goto(&service, &index, uri, code, "value;");
     let method_line = pos_for(code, "static int value()").line;
-    assert_ne!(field_loc.range.start.line, method_line, "field resolved to method");
+    assert_ne!(
+        field_loc.range.start.line, method_line,
+        "field resolved to method"
+    );
 
     let method_loc = goto(&service, &index, uri, code, "value();");
     assert_eq!(method_loc.range.start.line, method_line);
@@ -229,8 +232,16 @@ public class String {}
 "#;
 
     let index = GlobalIndex::new();
-    parse_and_index(java_lang_string, "file:///workspace/java/lang/String.java", &index);
-    parse_and_index(other_string, "file:///workspace/com/other/String.java", &index);
+    parse_and_index(
+        java_lang_string,
+        "file:///workspace/java/lang/String.java",
+        &index,
+    );
+    parse_and_index(
+        other_string,
+        "file:///workspace/com/other/String.java",
+        &index,
+    );
 
     let uri = "file:///workspace/Main.java";
     let service = JavaService;

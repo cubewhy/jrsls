@@ -1,5 +1,5 @@
 use ropey::Rope;
-use tower_lsp::lsp_types::{DocumentSymbol, Location, Position};
+use tower_lsp::lsp_types::{CompletionItem, DocumentSymbol, Location, Position};
 use tree_sitter::Tree;
 
 use crate::state::GlobalIndex;
@@ -17,6 +17,16 @@ pub trait LanguageService: Send + Sync {
         index: &GlobalIndex,
         current_uri: &str,
     ) -> Option<Location>;
+
+    fn completion(
+        &self,
+        tree: &Tree,
+        rope: &Rope,
+        position: Position,
+        index: &GlobalIndex,
+        current_uri: &str,
+        keywords: &[String],
+    ) -> Option<Vec<CompletionItem>>;
 }
 
 pub mod java;

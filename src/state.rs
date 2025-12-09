@@ -29,6 +29,7 @@ pub struct MemberLocation {
     pub is_varargs: bool,
     pub param_types: Vec<crate::ast::InferredType>,
     pub is_field: bool,
+    pub field_type: Option<crate::ast::InferredType>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -49,6 +50,7 @@ pub struct IndexedMember {
     pub is_varargs: bool,
     pub param_types: Vec<crate::ast::InferredType>,
     pub is_field: bool,
+    pub field_type: Option<crate::ast::InferredType>,
 }
 
 #[salsa::input]
@@ -175,6 +177,35 @@ impl GlobalIndex {
                         is_varargs: member.is_varargs,
                         param_types: member.param_types.clone(),
                         is_field: member.is_field,
+                        field_type: member.field_type.clone(),
+                    })
+            })
+            .collect()
+    }
+
+    pub fn members_of_class(&self, fqcn: &str) -> Vec<MemberLocation> {
+        let db = match self.storage.lock() {
+            Ok(db) => db,
+            Err(_) => return Vec::new(),
+        };
+
+        self.handles
+            .iter()
+            .flat_map(|entry| {
+                entry
+                    .value()
+                    .members(&*db)
+                    .into_iter()
+                    .filter(move |m| m.fqmn.starts_with(&format!("{}.", fqcn)))
+                    .map(|member| MemberLocation {
+                        fqmn: member.fqmn.clone(),
+                        uri: member.uri.clone(),
+                        range: member.range,
+                        param_count: member.param_count,
+                        is_varargs: member.is_varargs,
+                        param_types: member.param_types.clone(),
+                        is_field: member.is_field,
+                        field_type: member.field_type.clone(),
                     })
             })
             .collect()

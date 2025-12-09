@@ -23,6 +23,14 @@ struct Cli {
     /// Override JAVA_HOME (defaults to the JAVA_HOME environment variable)
     #[arg(long)]
     java_home: Option<String>,
+
+    /// Java language level (affects keyword set); examples: 8, 11, 17, 21
+    #[arg(long, default_value_t = 17)]
+    java_version: u16,
+
+    /// Comma-separated keyword list override
+    #[arg(long)]
+    java_keywords: Option<String>,
 }
 
 #[tokio::main]
@@ -31,8 +39,10 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     setup_java_home(&cli);
+    let keywords = collect_keywords(&cli);
 
-    let (service, socket) = LspService::new(LspBackend::new);
+    let config = jrsls::backend::ServerConfig { keywords };
+    let (service, socket) = LspService::new(move |client| LspBackend::new(client, config.clone()));
 
     match cli.mode {
         Mode::TcpSocket => {
@@ -71,4 +81,79 @@ fn setup_java_home(cli: &Cli) {
     } else {
         tracing::warn!("JAVA_HOME is not set; Java resolution may be limited");
     }
+}
+
+fn collect_keywords(cli: &Cli) -> Vec<String> {
+    if let Some(list) = &cli.java_keywords {
+        return list
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+    }
+
+    let mut keywords = vec![
+        "abstract",
+        "assert",
+        "boolean",
+        "break",
+        "byte",
+        "case",
+        "catch",
+        "char",
+        "class",
+        "const",
+        "continue",
+        "default",
+        "do",
+        "double",
+        "else",
+        "enum",
+        "extends",
+        "final",
+        "finally",
+        "float",
+        "for",
+        "goto",
+        "if",
+        "implements",
+        "import",
+        "instanceof",
+        "int",
+        "interface",
+        "long",
+        "native",
+        "new",
+        "package",
+        "private",
+        "protected",
+        "public",
+        "return",
+        "short",
+        "static",
+        "strictfp",
+        "super",
+        "switch",
+        "synchronized",
+        "this",
+        "throw",
+        "throws",
+        "transient",
+        "try",
+        "void",
+        "volatile",
+        "while",
+    ];
+
+    if cli.java_version >= 10 {
+        keywords.push("var");
+    }
+    if cli.java_version >= 14 {
+        keywords.push("yield");
+    }
+    if cli.java_version >= 16 {
+        keywords.extend(["record", "sealed", "non-sealed", "permits"]);
+    }
+
+    keywords.into_iter().map(|s| s.to_string()).collect()
 }
