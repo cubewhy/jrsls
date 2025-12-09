@@ -201,23 +201,45 @@ fn traverse_tree(walker: &mut tree_sitter::TreeCursor, text: &ropey::Rope) -> Ve
             let node = walker.node();
             let kind = node.kind();
 
-            let symbol_kind = match kind {
-                "class_declaration" => Some(SymbolKind::CLASS),
-                "interface_declaration" => Some(SymbolKind::INTERFACE),
-                "method_declaration" => Some(SymbolKind::METHOD),
-                "field_declaration" => Some(SymbolKind::FIELD),
-                "constructor_declaration" => Some(SymbolKind::CONSTRUCTOR),
-                _ => None,
+            #[allow(deprecated)]
+            let (s_kind, name_node) = match kind {
+                "class_declaration" => (Some(SymbolKind::CLASS), node.child_by_field_name("name")),
+                "interface_declaration" => (
+                    Some(SymbolKind::INTERFACE),
+                    node.child_by_field_name("name"),
+                ),
+                "method_declaration" => {
+                    (Some(SymbolKind::METHOD), node.child_by_field_name("name"))
+                }
+                "constructor_declaration" => (
+                    Some(SymbolKind::CONSTRUCTOR),
+                    node.child_by_field_name("name"),
+                ),
+
+                "field_declaration" => {
+                    let mut cursor = node.walk();
+                    let declarator = node
+                        .children(&mut cursor)
+                        .find(|n| n.kind() == "variable_declarator");
+
+                    let name = declarator.and_then(|n| n.child_by_field_name("name"));
+
+                    (Some(SymbolKind::FIELD), name)
+                }
+
+                _ => (None, None),
             };
 
-            if let Some(s_kind) = symbol_kind {
-                let name_node = node.child_by_field_name("name").unwrap_or(node);
+            if let Some(s_kind) = s_kind {
+                let name_node = name_node.unwrap_or(node);
                 let name = get_node_text(name_node, text);
 
                 let range = node_range(node, text);
                 let selection_range = node_range(name_node, text);
 
                 let children = traverse_tree(walker, text);
+
+                tracing::info!("node name: {name}");
 
                 #[allow(deprecated)]
                 let symbol = DocumentSymbol {
