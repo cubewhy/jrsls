@@ -253,3 +253,52 @@ public class String {}
         loc.uri
     );
 }
+
+#[test]
+fn member_completion_qualifier_chain() {
+    let code = r#"
+import java.util.ArrayList;
+
+class Main {
+    void demo() {
+        ArrayList arr = new ArrayList();
+        arr.si
+    }
+}
+"#;
+
+    let index = GlobalIndex::new();
+    // stub java.util.ArrayList with size()
+    let arraylist = r#"
+package java.util;
+public class ArrayList {
+    public int size() { return 0; }
+    public void clear() {}
+}
+"#;
+    parse_and_index(arraylist, "file:///workspace/java/util/ArrayList.java", &index);
+
+    let uri = "file:///workspace/Main.java";
+    let service = JavaService;
+
+    let caret_pos = pos_for(code, "arr.si");
+    let caret = Position::new(caret_pos.line, caret_pos.character + "arr.si".len() as u32);
+
+    let items = service
+        .completion(
+            &parse_and_index(code, uri, &index),
+            &Rope::from_str(code),
+            caret,
+            &index,
+            uri,
+            &[],
+        )
+        .unwrap();
+
+    let labels: Vec<_> = items.iter().map(|i| i.label.clone()).collect();
+    assert!(
+        labels.iter().any(|l| l.starts_with("size")),
+        "expected size() in completions, got {:?}",
+        labels
+    );
+}

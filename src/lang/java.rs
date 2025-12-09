@@ -38,7 +38,7 @@ impl LanguageService for JavaService {
         if let Some(ctx) = member_completion_context(tree, rope, position, prev_char) {
             let file_info = index.file_info(current_uri)?;
             let qualifier_fqcn =
-                resolve_qualifier_for_completion(&ctx.qualifier, index, &file_info)?;
+                resolve_qualifier_for_completion(&ctx.qualifier, index, &file_info, tree, rope)?;
 
             let members = index.members_of_class(&qualifier_fqcn);
             let mut seen = HashSet::new();
@@ -173,6 +173,13 @@ impl LanguageService for JavaService {
             target_name,
             call_args.len()
         );
+
+        if let Some(range) = find_local_variable(node, rope, &target_name) {
+            return Some(Location::new(
+                lsp_types::Url::parse(current_uri).unwrap(),
+                range,
+            ));
+        }
 
         if node.kind() != "identifier"
             && node.kind() != "type_identifier"
@@ -333,8 +340,8 @@ fn match_member(
         );
         return None;
     }
-    let qualifier_candidates = index.classes_by_short_name(&qualifier);
-    let qualifier_fqcn = resolve_qualifier_fqcn(&qualifier, &qualifier_candidates, file_info);
+    let qualifier_fqcn =
+        resolve_qualifier_type(node, rope, &qualifier, index, file_info);
     let fqcn = qualifier_fqcn.clone().unwrap_or_default();
     let arg_count = count_args(node);
     let prefer_method_usage = has_ancestor_kind(node, "method_invocation")
@@ -521,6 +528,51 @@ fn match_member_arity(member: &state::MemberLocation, arg_count: usize) -> bool 
     }
 }
 
+fn find_local_variable(node: Node, rope: &Rope, name: &str) -> Option<lsp_types::Range> {
+    let target_byte = node.start_byte();
+    let mut curr = Some(node);
+
+    while let Some(n) = curr {
+        if n.kind() == "method_declaration" {
+            if let Some(params) = n.child_by_field_name("parameters") {
+                let mut cursor = params.walk();
+                for p in params.children(&mut cursor) {
+                    if (p.kind() == "formal_parameter" || p.kind() == "spread_parameter")
+                        && let Some(name_node) = p.child_by_field_name("name")
+                        && get_node_text(name_node, rope) == name
+                    {
+                        return Some(node_range(name_node, rope));
+                    }
+                }
+            }
+        }
+
+        if matches!(n.kind(), "block" | "method_declaration" | "program") {
+            let mut cursor = n.walk();
+            for child in n.children(&mut cursor) {
+                if child.start_byte() >= target_byte {
+                    break;
+                }
+                if child.kind() == "local_variable_declaration" {
+                    let mut sub = child.walk();
+                    for var in child.children(&mut sub) {
+                        if var.kind() == "variable_declarator"
+                            && let Some(name_node) = var.child_by_field_name("name")
+                            && get_node_text(name_node, rope) == name
+                        {
+                            return Some(node_range(name_node, rope));
+                        }
+                    }
+                }
+            }
+        }
+
+        curr = n.parent();
+    }
+
+    None
+}
+
 fn offset_for_position(rope: &Rope, position: Position) -> Option<usize> {
     let line = position.line as usize;
     if line >= rope.len_lines() {
@@ -566,8 +618,29 @@ fn resolve_qualifier_for_completion(
     qualifier: &str,
     index: &GlobalIndex,
     file_info: &state::FileInfo,
+    tree: &Tree,
+    rope: &Rope,
 ) -> Option<String> {
-    resolve_qualifier_chain(qualifier, index, file_info)
+    if let Some(fqcn) = resolve_qualifier_chain(qualifier, index, file_info) {
+        return Some(fqcn);
+    }
+
+    // Try to infer variable type from local declarations
+    if let Some(type_name) = find_identifier_type(tree.root_node(), rope, qualifier) {
+        if let Some(fqcn) = resolve_class_from_name(&type_name, index, Some(file_info)) {
+            return Some(fqcn);
+        }
+        return Some(type_name);
+    }
+
+    if let Some(type_name) = find_type_by_text_scan(rope, qualifier) {
+        if let Some(fqcn) = resolve_class_from_name(&type_name, index, Some(file_info)) {
+            return Some(fqcn);
+        }
+        return Some(type_name);
+    }
+
+    None
 }
 
 struct MemberContext {
@@ -619,7 +692,8 @@ fn member_completion_context(
         }
     }
 
-    None
+    // Fallback to textual split: find nearest '.' before cursor
+    textual_member_context(rope, position)
 }
 
 fn slice_prefix(node: Node, rope: &Rope, position: Position) -> String {
@@ -630,6 +704,20 @@ fn slice_prefix(node: Node, rope: &Rope, position: Position) -> String {
     }
     let end = caret_char.min(rope.byte_to_char(node.end_byte()));
     rope.slice(node_start..end).to_string()
+}
+
+fn textual_member_context(rope: &Rope, position: Position) -> Option<MemberContext> {
+    let caret_char = rope.line_to_char(position.line as usize) + position.character as usize;
+    let line_start = rope.line_to_char(position.line as usize);
+    let text = rope.slice(line_start..caret_char).to_string();
+    if let Some(dot_idx) = text.rfind('.') {
+        let qualifier = text[..dot_idx].trim().to_string();
+        let prefix = text[dot_idx + 1..].to_string();
+        if !qualifier.is_empty() {
+            return Some(MemberContext { qualifier, prefix });
+        }
+    }
+    None
 }
 
 fn resolve_class_from_name(
@@ -690,6 +778,52 @@ fn resolve_qualifier_chain(
 
     Some(current_fqcn)
 }
+
+fn find_identifier_type(root: Node, rope: &Rope, name: &str) -> Option<String> {
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "local_variable_declaration" || node.kind() == "field_declaration" {
+            if let Some(t) = node.child_by_field_name("type") {
+                let mut sub_cursor = node.walk();
+                for child in node.children(&mut sub_cursor) {
+                    if child.kind() == "variable_declarator"
+                        && let Some(n) = child.child_by_field_name("name")
+                        && get_node_text(n, rope) == name
+                    {
+                        return Some(get_node_text(t, rope));
+                    }
+                }
+            }
+        }
+
+        let mut child_cursor = node.walk();
+        for child in node.children(&mut child_cursor) {
+            stack.push(child);
+        }
+    }
+    None
+}
+
+fn find_type_by_text_scan(rope: &Rope, name: &str) -> Option<String> {
+    for line in rope.lines() {
+        let text = line.to_string();
+        if !text.contains(name) {
+            continue;
+        }
+        let tokens: Vec<_> = text
+            .split(|c: char| c.is_whitespace() || c == ';' || c == '=')
+            .filter(|s| !s.is_empty())
+            .collect();
+        if tokens.len() >= 2 {
+            let ty = tokens[0];
+            let var = tokens[1];
+            if var == name {
+                return Some(ty.to_string());
+            }
+        }
+    }
+    None
+}
 fn resolve_qualifier(node: Node, rope: &Rope) -> Option<String> {
     // Handles both field_access (System.out) and method_invocation (obj.method())
     if let Some(parent) = node.parent() {
@@ -747,6 +881,45 @@ fn resolve_qualifier_fqcn(
         .iter()
         .find(|c| c.fqcn.ends_with(&format!(".{}", qualifier)) || c.fqcn == qualifier)
         .map(|c| c.fqcn.clone())
+}
+
+fn resolve_qualifier_type(
+    node: Node,
+    rope: &Rope,
+    qualifier: &str,
+    index: &GlobalIndex,
+    file_info: &state::FileInfo,
+) -> Option<String> {
+    // Try direct class resolution first
+    if let Some(fqcn) =
+        resolve_qualifier_fqcn(qualifier, &index.classes_by_short_name(qualifier), file_info)
+    {
+        return Some(fqcn);
+    }
+
+    // Try field chain resolution (e.g., System.out -> PrintStream)
+    if let Some(fqcn) = resolve_qualifier_chain(qualifier, index, file_info) {
+        return Some(fqcn);
+    }
+
+    // Try local variable/type inference by scanning declarations
+    if let Some(type_name) = find_identifier_type(root_of(node), rope, qualifier)
+        .or_else(|| find_type_by_text_scan(rope, qualifier))
+    {
+        if let Some(fqcn) = resolve_class_from_name(&type_name, index, Some(file_info)) {
+            return Some(fqcn);
+        }
+        return Some(type_name);
+    }
+
+    None
+}
+
+fn root_of(mut node: Node) -> Node {
+    while let Some(p) = node.parent() {
+        node = p;
+    }
+    node
 }
 
 fn traverse_node(node: Node, rope: &Rope) -> Vec<DocumentSymbol> {
