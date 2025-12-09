@@ -1,12 +1,11 @@
-use tower_lsp::lsp_types::Position;
+use ropey::Rope;
+use tower_lsp::lsp_types::{Location, Position, Url};
 
 use jrsls::{
     indexer::Indexer,
-    lang::{LanguageService, java::JavaService},
+    lang::{java::JavaService, LanguageService},
     state::GlobalIndex,
 };
-use ropey::Rope;
-use tower_lsp::lsp_types::{Location, Url};
 
 fn parse_and_index(code: &str, uri: &str, index: &GlobalIndex) -> tree_sitter::Tree {
     let rope = Rope::from_str(code);
@@ -65,14 +64,9 @@ class Main {
 }"#;
     let uri = "file:///workspace/Main.java";
     let index = GlobalIndex::new();
-    let tree = parse_and_index(code, uri, &index);
-    let rope = Rope::from_str(code);
     let service = JavaService;
-    let position = pos_for(code, "func(\"1\"");
 
-    let loc = service
-        .goto_definition(&tree, &rope, position, &index, uri)
-        .expect("definition");
+    let loc = goto(&service, &index, uri, code, "func(\"1\"");
 
     assert!(
         loc.uri == Url::parse(uri).unwrap(),
@@ -107,18 +101,17 @@ class Main {
 }"#;
     let uri = "file:///workspace/Main.java";
     let index = GlobalIndex::new();
-    let tree = parse_and_index(code, uri, &index);
-    let rope = Rope::from_str(code);
     let service = JavaService;
-    let position = pos_for(code, "println(1)");
 
-    let loc = service
-        .goto_definition(&tree, &rope, position, &index, uri)
-        .expect("definition");
+    let loc = goto(&service, &index, uri, code, "println(1)");
 
+    let expected_line = pos_for(code, "println(int");
     let def_line = loc.range.start.line;
-    // First overload (println(int)) is before the varargs one
-    assert_eq!(def_line, 4, "expected int overload, got line {}", def_line);
+    assert_eq!(
+        def_line, expected_line.line,
+        "expected int overload, got line {}",
+        def_line
+    );
 }
 
 #[test]
@@ -207,11 +200,45 @@ class Main {
 
     let field_loc = goto(&service, &index, uri, code, "value;");
     let method_line = pos_for(code, "static int value()").line;
-    assert_ne!(
-        field_loc.range.start.line, method_line,
-        "field resolved to method"
-    );
+    assert_ne!(field_loc.range.start.line, method_line, "field resolved to method");
 
     let method_loc = goto(&service, &index, uri, code, "value();");
     assert_eq!(method_loc.range.start.line, method_line);
+}
+
+#[test]
+fn prefers_java_lang_string_over_other_packages() {
+    let code = r#"
+package org.cubewhy;
+
+class Main {
+    String s = "";
+}
+"#;
+
+    // stub out java.lang.String and another competing String class
+    let java_lang_string = r#"
+package java.lang;
+public class String {
+    public String() {}
+}
+"#;
+    let other_string = r#"
+package com.other;
+public class String {}
+"#;
+
+    let index = GlobalIndex::new();
+    parse_and_index(java_lang_string, "file:///workspace/java/lang/String.java", &index);
+    parse_and_index(other_string, "file:///workspace/com/other/String.java", &index);
+
+    let uri = "file:///workspace/Main.java";
+    let service = JavaService;
+    let loc = goto(&service, &index, uri, code, "String s");
+
+    assert!(
+        loc.uri.as_str().ends_with("java/lang/String.java"),
+        "expected java.lang.String, got {}",
+        loc.uri
+    );
 }

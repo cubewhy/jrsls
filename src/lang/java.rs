@@ -79,18 +79,26 @@ impl LanguageService for JavaService {
             return Some(Location::new(loc.uri, loc.range));
         }
 
-        if let Some(loc) = match_member(
-            node,
-            rope,
-            &global_members,
-            &file_info,
-            index,
-            qualifier.as_deref(),
-            &call_args,
-            current_uri,
-            node.parent()
-                .is_some_and(|p| p.kind() == "method_invocation"),
-        ) {
+        let allow_member_lookup = qualifier.is_some()
+            || node.kind() == "field_identifier"
+            || node
+                .parent()
+                .is_some_and(|p| p.kind() == "method_invocation" || p.kind() == "field_access");
+
+        if allow_member_lookup
+            && let Some(loc) = match_member(
+                node,
+                rope,
+                &global_members,
+                &file_info,
+                index,
+                qualifier.as_deref(),
+                &call_args,
+                current_uri,
+                node.parent()
+                    .is_some_and(|p| p.kind() == "method_invocation"),
+            )
+        {
             return Some(loc);
         }
 
@@ -182,6 +190,13 @@ fn match_member(
         .map(|q| q.to_string())
         .or_else(|| resolve_qualifier(node, rope))
         .unwrap_or_default();
+    if qualifier.is_empty() && !prefer_method_usage_hint {
+        tracing::debug!(
+            "skip member resolution: no qualifier for {}",
+            get_node_text(node, rope)
+        );
+        return None;
+    }
     let qualifier_candidates = index.classes_by_short_name(&qualifier);
     let qualifier_fqcn = resolve_qualifier_fqcn(&qualifier, &qualifier_candidates, file_info);
     let fqcn = qualifier_fqcn.clone().unwrap_or_default();
