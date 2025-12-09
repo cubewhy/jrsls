@@ -1,7 +1,10 @@
 use super::LanguageService;
-use crate::utils::{get_node_text, node_range};
+use crate::{
+    state::GlobalIndex,
+    utils::{find_definition_in_file, get_node_text, node_range},
+};
 use ropey::Rope;
-use tower_lsp::lsp_types::{DocumentSymbol, SymbolKind};
+use tower_lsp::lsp_types::{self, DocumentSymbol, Location, Position, Range, SymbolKind};
 use tree_sitter::{Node, Tree};
 
 pub struct JavaService;
@@ -13,6 +16,75 @@ impl LanguageService for JavaService {
 
     fn document_symbol(&self, tree: &Tree, rope: &Rope) -> Vec<DocumentSymbol> {
         traverse_node(tree.root_node(), rope)
+    }
+
+    fn goto_definition(
+        &self,
+        tree: &Tree,
+        rope: &Rope,
+        position: Position,
+        index: &GlobalIndex,
+        current_uri: &str,
+    ) -> Option<Location> {
+        let line = position.line as usize;
+        let char_col = position.character as usize;
+        let char_idx = rope.line_to_char(line) + char_col;
+        let byte_idx = rope.char_to_byte(char_idx);
+
+        let root = tree.root_node();
+        let node = root.descendant_for_byte_range(byte_idx, byte_idx)?;
+
+        if node.kind() != "identifier" && node.kind() != "type_identifier" {
+            return None;
+        }
+
+        let target_name = get_node_text(node, rope);
+        tracing::info!("Trying to jump to: {}", target_name);
+
+        if let Some(range) = find_definition_in_file(node, &target_name, rope) {
+            return Some(Location::new(
+                lsp_types::Url::parse(current_uri).unwrap(),
+                range,
+            ));
+        }
+
+        if let Some(file_info) = index.file_info.get(current_uri) {
+            // match imports
+            for import in &file_info.imports {
+                if import.ends_with(&format!(".{}", target_name))
+                    && let Some(candidates) = index.short_name_map.get(&target_name)
+                {
+                    for (fqcn, url) in candidates.value() {
+                        if fqcn == import {
+                            return Some(Location::new(url.clone(), Range::default())); // TODO: Range 需要精确到类定义位置
+                        }
+                    }
+                }
+            }
+
+            // match same package
+            if let Some(pkg) = &file_info.package_name {
+                let potential_fqcn = format!("{}.{}", pkg, target_name);
+                if let Some(candidates) = index.short_name_map.get(&target_name) {
+                    for (fqcn, url) in candidates.value() {
+                        if fqcn == &potential_fqcn {
+                            return Some(Location::new(url.clone(), Range::default()));
+                        }
+                    }
+                }
+            }
+        }
+
+        // fuzzel match (short name)
+        if let Some(candidates) = index.short_name_map.get(&target_name)
+            && let Some((_, url)) = candidates.first()
+        {
+            return Some(Location::new(url.clone(), Range::default()));
+        }
+
+        tracing::warn!("it's None");
+
+        None
     }
 }
 

@@ -1,8 +1,10 @@
+use crate::indexer::Indexer;
 use crate::lang::{LanguageService, java::JavaService};
-use crate::state::Document;
+use crate::state::{Document, GlobalIndex};
 use dashmap::DashMap;
 use ropey::Rope;
 use std::collections::HashMap;
+use std::sync::Arc;
 use tokio::sync::Mutex;
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
@@ -12,6 +14,7 @@ use tree_sitter::{InputEdit, Point};
 pub struct LspBackend {
     pub client: Client,
     pub documents: DashMap<String, Document>,
+    pub index: Arc<GlobalIndex>,
     services: HashMap<String, Box<dyn LanguageService>>,
     parsers: DashMap<String, Mutex<tree_sitter::Parser>>,
 }
@@ -35,6 +38,7 @@ impl LspBackend {
         Self {
             client,
             documents: DashMap::new(),
+            index: Arc::new(GlobalIndex::new()),
             services,
             parsers,
         }
@@ -54,8 +58,9 @@ impl LanguageServer for LspBackend {
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(
                     TextDocumentSyncKind::INCREMENTAL,
                 )),
+                definition_provider: Some(OneOf::Left(true)),
                 document_symbol_provider: Some(OneOf::Left(true)),
-                completion_provider: Some(CompletionOptions::default()),
+                // completion_provider: Some(CompletionOptions::default()),
                 ..Default::default()
             },
             ..Default::default()
@@ -174,6 +179,9 @@ impl LanguageServer for LspBackend {
                 .unwrap();
 
             doc.tree = new_tree;
+
+            // update global index
+            Indexer::update_file(&self.index, &uri, &doc.tree, &doc.text);
         }
     }
 
@@ -193,6 +201,32 @@ impl LanguageServer for LspBackend {
                 let symbols = service.document_symbol(&doc.tree, &doc.text);
                 return Ok(Some(DocumentSymbolResponse::Nested(symbols)));
             }
+        }
+
+        Ok(None)
+    }
+
+    async fn goto_definition(
+        &self,
+        params: GotoDefinitionParams,
+    ) -> Result<Option<GotoDefinitionResponse>> {
+        let uri = params
+            .text_document_position_params
+            .text_document
+            .uri
+            .to_string();
+        let position = params.text_document_position_params.position;
+        let ext = match self.get_ext(&uri) {
+            Some(e) => e,
+            None => return Ok(None),
+        };
+
+        if let Some(doc) = self.documents.get(&uri)
+            && let Some(service) = self.services.get(&ext)
+            && let Some(location) =
+                service.goto_definition(&doc.tree, &doc.text, position, &self.index, &uri)
+        {
+            return Ok(Some(GotoDefinitionResponse::Scalar(location)));
         }
 
         Ok(None)

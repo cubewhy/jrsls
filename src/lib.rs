@@ -1,4 +1,5 @@
-pub(crate) mod backend;
-pub(crate) mod lang;
-pub(crate) mod state;
-pub(crate) mod utils;
+pub mod backend;
+pub mod indexer;
+pub mod lang;
+pub mod state;
+pub mod utils;

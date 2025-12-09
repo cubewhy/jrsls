@@ -1,9 +1,4 @@
-mod backend;
-mod lang;
-mod state;
-mod utils;
-
-use backend::LspBackend;
+use jrsls::backend::LspBackend;
 use tower_lsp::{LspService, Server};
 
 #[tokio::main]
