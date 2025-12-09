@@ -1,6 +1,7 @@
 use crate::filesystem::collect_files_with_ext;
 use crate::indexer::Indexer;
 use crate::lang::{LanguageService, java::JavaService};
+use crate::library::SourceArchiveRegistry;
 use crate::state::{Document, GlobalIndex};
 use dashmap::DashMap;
 use ropey::Rope;
@@ -12,6 +13,7 @@ use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer};
 use tree_sitter::{InputEdit, Point};
+use zip::ZipArchive;
 
 pub struct LspBackend {
     pub client: Client,
@@ -20,6 +22,7 @@ pub struct LspBackend {
     services: HashMap<String, Box<dyn LanguageService>>,
     parsers: DashMap<String, Mutex<tree_sitter::Parser>>,
     workspace_root: RwLock<Option<PathBuf>>,
+    source_archives: Arc<SourceArchiveRegistry>,
 }
 
 impl LspBackend {
@@ -45,6 +48,7 @@ impl LspBackend {
             services,
             parsers,
             workspace_root: RwLock::new(None),
+            source_archives: Arc::new(SourceArchiveRegistry::new()),
         }
     }
 
@@ -116,6 +120,78 @@ impl LspBackend {
         Indexer::update_file(&self.index, &uri.to_string(), &tree, &rope);
         Ok(())
     }
+
+    async fn index_builtin_library(&self) {
+        let java_home = match std::env::var("JAVA_HOME") {
+            Ok(val) => PathBuf::from(val),
+            Err(_) => {
+                tracing::info!("JAVA_HOME not set; skip JDK source indexing");
+                return;
+            }
+        };
+
+        let mut candidates = vec![
+            java_home.join("lib").join("src.zip"),
+            java_home.join("src.zip"),
+        ];
+        candidates.retain(|p| p.exists());
+
+        let Some(zip_path) = candidates.into_iter().next() else {
+            tracing::info!("No src.zip found in JAVA_HOME; skip JDK source indexing");
+            return;
+        };
+
+        tracing::info!("Indexing JDK sources from {:?}", zip_path);
+        self.source_archives
+            .register_zip("jrsls-std", zip_path.clone());
+        let index = self.index.clone();
+
+        let result = tokio::task::spawn_blocking(move || {
+            let file = std::fs::File::open(&zip_path)?;
+            let mut archive = ZipArchive::new(file)?;
+
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_java::LANGUAGE.into())
+                .map_err(|e| anyhow::anyhow!("Failed to load Java grammar: {}", e))?;
+
+            for i in 0..archive.len() {
+                let mut entry = archive.by_index(i)?;
+                if entry.is_dir() {
+                    continue;
+                }
+                let name = entry.name().to_string();
+                if !name.ends_with(".java") {
+                    continue;
+                }
+
+                let mut contents = String::new();
+                use std::io::Read;
+                entry.read_to_string(&mut contents)?;
+
+                let rope = Rope::from_str(&contents);
+                let tree = parser
+                    .parse_with_options(
+                        &mut |offset, _| rope.byte_slice(offset..).chunks().next().unwrap_or(""),
+                        None,
+                        None,
+                    )
+                    .ok_or_else(|| anyhow::anyhow!("Failed to parse {}", name))?;
+
+                let uri = format!("jrsls-std:///{}", name);
+                Indexer::update_file(&index, &uri, &tree, &rope);
+            }
+
+            anyhow::Ok(())
+        })
+        .await;
+
+        match result {
+            Ok(Ok(_)) => tracing::info!("JDK source indexing finished"),
+            Ok(Err(err)) => tracing::warn!("JDK source indexing failed: {}", err),
+            Err(err) => tracing::warn!("JDK source indexing task panicked: {}", err),
+        }
+    }
 }
 
 #[tower_lsp::async_trait]
@@ -157,6 +233,7 @@ impl LanguageServer for LspBackend {
             .log_message(MessageType::INFO, "Server initialized!")
             .await;
         self.index_workspace().await;
+        self.index_builtin_library().await;
     }
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
@@ -313,9 +390,12 @@ impl LanguageServer for LspBackend {
 
         if let Some(doc) = self.documents.get(&uri)
             && let Some(service) = self.services.get(&ext)
-            && let Some(location) =
+            && let Some(mut location) =
                 service.goto_definition(&doc.tree, &doc.text, position, &self.index, &uri)
         {
+            if let Some(materialized) = self.source_archives.materialize(&location) {
+                location = materialized;
+            }
             return Ok(Some(GotoDefinitionResponse::Scalar(location)));
         }
 

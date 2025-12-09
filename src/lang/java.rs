@@ -61,10 +61,10 @@ impl LanguageService for JavaService {
             return Some(Location::new(loc.uri, loc.range));
         }
 
-        if let Some(pkg) = &file_info.package_name {
-            if let Some(loc) = match_same_package(&global_candidates, pkg, &target_name) {
-                return Some(Location::new(loc.uri, loc.range));
-            }
+        if let Some(pkg) = &file_info.package_name
+            && let Some(loc) = match_same_package(&global_candidates, pkg, &target_name)
+        {
+            return Some(Location::new(loc.uri, loc.range));
         }
 
         select_fallback(global_candidates)

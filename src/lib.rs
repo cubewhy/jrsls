@@ -4,5 +4,6 @@ pub mod filesystem;
 pub mod indexer;
 pub mod inference;
 pub mod lang;
+pub mod library;
 pub mod state;
 pub mod utils;
