@@ -1,4 +1,4 @@
-use crate::state::IndexedClass;
+use crate::state::{IndexedClass, IndexedMember};
 use crate::utils::{get_node_text, node_range};
 use ropey::Rope;
 use tower_lsp::lsp_types;
@@ -34,6 +34,7 @@ impl Indexer {
         let mut imports = Vec::new();
         let mut defined_classes = Vec::new();
         let mut indexed_classes = Vec::new();
+        let mut indexed_members = Vec::new();
 
         let url = match lsp_types::Url::parse(uri) {
             Ok(u) => u,
@@ -62,19 +63,68 @@ impl Indexer {
                         .map(|pkg| format!("{}.{}", pkg, text))
                         .unwrap_or(text.clone());
 
+                    let class_range = node_range(node.parent().unwrap_or(node), rope);
+
                     indexed_classes.push(IndexedClass {
-                        short_name: text,
-                        fqcn,
+                        short_name: text.clone(),
+                        fqcn: fqcn.clone(),
                         uri: url.clone(),
-                        range: node_range(node, rope),
+                        range: class_range,
                     });
+
+                    // collect members from class body
+                    if let Some(class_node) = node.parent()
+                        && let Some(body) = class_node.child_by_field_name("body")
+                    {
+                        collect_members(body, &fqcn, &mut indexed_members, &url, rope);
+                    }
                 }
                 _ => {}
             }
         }
 
-        index.upsert_file(uri, package_name, imports, indexed_classes);
+        index.upsert_file(uri, package_name, imports, indexed_classes, indexed_members);
 
         tracing::debug!("Indexed {}: classes={:?}", uri, defined_classes);
+    }
+}
+
+fn collect_members(
+    class_body: tree_sitter::Node,
+    fqcn: &str,
+    members: &mut Vec<IndexedMember>,
+    uri: &lsp_types::Url,
+    rope: &Rope,
+) {
+    let mut cursor = class_body.walk();
+    for child in class_body.children(&mut cursor) {
+        if child.kind() == "method_declaration" {
+            if let Some(name_node) = child.child_by_field_name("name") {
+                let name = get_node_text(name_node, rope);
+                let fqmn = format!("{}.{}", fqcn, name);
+                members.push(IndexedMember {
+                    name,
+                    fqmn,
+                    uri: uri.clone(),
+                    range: node_range(name_node, rope),
+                });
+            }
+        } else if child.kind() == "field_declaration" {
+            let mut sub_cursor = child.walk();
+            for sub in child.children(&mut sub_cursor) {
+                if sub.kind() == "variable_declarator"
+                    && let Some(name_node) = sub.child_by_field_name("name")
+                {
+                    let name = get_node_text(name_node, rope);
+                    let fqmn = format!("{}.{}", fqcn, name);
+                    members.push(IndexedMember {
+                        name,
+                        fqmn,
+                        uri: uri.clone(),
+                        range: node_range(name_node, rope),
+                    });
+                }
+            }
+        }
     }
 }

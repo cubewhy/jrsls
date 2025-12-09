@@ -37,10 +37,14 @@ impl LanguageService for JavaService {
             call_args.len()
         );
 
-        if node.kind() != "identifier" && node.kind() != "type_identifier" {
+        if node.kind() != "identifier"
+            && node.kind() != "type_identifier"
+            && node.kind() != "field_identifier"
+        {
             return None;
         }
         let global_candidates = index.classes_by_short_name(&target_name);
+        let global_members = index.members_by_name(&target_name);
 
         if let Some(range) =
             find_definition_in_file(node, &target_name, rope, &call_args, index, current_uri)
@@ -55,6 +59,10 @@ impl LanguageService for JavaService {
             return select_fallback(global_candidates);
         };
 
+        if let Some(loc) = match_same_file(&global_candidates, current_uri) {
+            return Some(Location::new(loc.uri, loc.range));
+        }
+
         if let Some(loc) =
             match_imported_symbol(&global_candidates, &file_info.imports, &target_name)
         {
@@ -67,7 +75,16 @@ impl LanguageService for JavaService {
             return Some(Location::new(loc.uri, loc.range));
         }
 
-        select_fallback(global_candidates)
+        if let Some(loc) = match_member(node, rope, &global_members, &file_info, index) {
+            return Some(loc);
+        }
+
+        if let Some(loc) = match_java_lang(&global_candidates) {
+            return Some(Location::new(loc.uri, loc.range));
+        }
+
+        // Respect Java import rules: if nothing matched, do not jump.
+        None
     }
 }
 
@@ -98,18 +115,123 @@ fn match_same_package(
         .cloned()
 }
 
+fn match_same_file(
+    candidates: &[state::ClassLocation],
+    current_uri: &str,
+) -> Option<state::ClassLocation> {
+    candidates
+        .iter()
+        .find(|loc| loc.uri.as_str() == current_uri)
+        .cloned()
+}
+
+fn match_java_lang(candidates: &[state::ClassLocation]) -> Option<state::ClassLocation> {
+    candidates
+        .iter()
+        .find(|loc| loc.fqcn.starts_with("java.lang."))
+        .cloned()
+}
+
 fn select_fallback(candidates: Vec<state::ClassLocation>) -> Option<Location> {
     if candidates.is_empty() {
         return None;
     }
-    if let Some(java_lang) = candidates
-        .iter()
-        .find(|loc| loc.fqcn.starts_with("java.lang."))
-    {
-        return Some(Location::new(java_lang.uri.clone(), java_lang.range));
-    }
-    let loc = &candidates[0];
+    let mut ordered = candidates;
+    ordered.sort_by_key(|loc| {
+        if loc.uri.scheme() == "file" || loc.uri.scheme() == "untitled" {
+            0
+        } else if loc.fqcn.starts_with("java.lang.") {
+            1
+        } else {
+            2
+        }
+    });
+
+    let loc = &ordered[0];
     Some(Location::new(loc.uri.clone(), loc.range))
+}
+
+fn match_member(
+    node: Node,
+    rope: &Rope,
+    members: &[state::MemberLocation],
+    file_info: &state::FileInfo,
+    index: &GlobalIndex,
+) -> Option<Location> {
+    // Attempt to use the qualifier's type to narrow down the member
+    let qualifier = resolve_qualifier(node, rope)?;
+    let qualifier_candidates = index.classes_by_short_name(&qualifier);
+    let qualifier_fqcn = resolve_qualifier_fqcn(&qualifier, &qualifier_candidates, file_info);
+
+    if let Some(fqcn) = qualifier_fqcn {
+        if let Some(member) = members
+            .iter()
+            .find(|m| m.fqmn.starts_with(&format!("{}.", fqcn)))
+        {
+            return Some(Location::new(member.uri.clone(), member.range));
+        }
+    }
+
+    members
+        .first()
+        .map(|m| Location::new(m.uri.clone(), m.range))
+}
+
+fn resolve_qualifier(node: Node, rope: &Rope) -> Option<String> {
+    // Handles both field_access (System.out) and method_invocation (obj.method())
+    if let Some(parent) = node.parent() {
+        if parent.kind() == "field_access" {
+            if let Some(object) = parent.child_by_field_name("object") {
+                return Some(get_node_text(object, rope));
+            }
+        }
+        if parent.kind() == "method_invocation" {
+            if let Some(object) = parent.child_by_field_name("object") {
+                return Some(get_node_text(object, rope));
+            }
+        }
+    }
+    None
+}
+
+fn resolve_qualifier_fqcn(
+    qualifier: &str,
+    class_candidates: &[state::ClassLocation],
+    file_info: &state::FileInfo,
+) -> Option<String> {
+    // If qualifier already looks qualified, use it directly
+    if qualifier.contains('.') {
+        return Some(qualifier.to_string());
+    }
+
+    // Try imports first
+    for import in &file_info.imports {
+        if import.ends_with(&format!(".{}", qualifier)) {
+            return Some(import.clone());
+        }
+    }
+
+    // Try same package
+    if let Some(pkg) = &file_info.package_name {
+        let fqcn = format!("{}.{}", pkg, qualifier);
+        if class_candidates.iter().any(|c| c.fqcn == fqcn) {
+            return Some(fqcn);
+        }
+    }
+
+    // Implicit java.lang
+    if let Some(c) = class_candidates
+        .iter()
+        .find(|c| c.fqcn.starts_with("java.lang."))
+    {
+        return Some(c.fqcn.clone());
+    }
+
+    // Fall back to any class with this short name
+    class_candidates
+        .iter()
+        .find(|c| c.fqcn.ends_with(&format!(".{}", qualifier)) || c.fqcn == qualifier)
+        .map(|c| c.fqcn.clone())
 }
 
 fn traverse_node(node: Node, rope: &Rope) -> Vec<DocumentSymbol> {
