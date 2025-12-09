@@ -45,14 +45,17 @@ impl LanguageService for JavaService {
         }
         let global_candidates = index.classes_by_short_name(&target_name);
         let global_members = index.members_by_name(&target_name);
+        let qualifier = resolve_qualifier(node, rope);
 
-        if let Some(range) =
-            find_definition_in_file(node, &target_name, rope, &call_args, index, current_uri)
-        {
-            return Some(Location::new(
-                lsp_types::Url::parse(current_uri).unwrap(),
-                range,
-            ));
+        if qualifier.is_none() {
+            if let Some(range) =
+                find_definition_in_file(node, &target_name, rope, &call_args, index, current_uri)
+            {
+                return Some(Location::new(
+                    lsp_types::Url::parse(current_uri).unwrap(),
+                    range,
+                ));
+            }
         }
 
         let Some(file_info) = index.file_info(current_uri) else {
@@ -75,7 +78,14 @@ impl LanguageService for JavaService {
             return Some(Location::new(loc.uri, loc.range));
         }
 
-        if let Some(loc) = match_member(node, rope, &global_members, &file_info, index) {
+        if let Some(loc) = match_member(
+            node,
+            rope,
+            &global_members,
+            &file_info,
+            index,
+            qualifier.as_deref(),
+        ) {
             return Some(loc);
         }
 
@@ -157,24 +167,39 @@ fn match_member(
     members: &[state::MemberLocation],
     file_info: &state::FileInfo,
     index: &GlobalIndex,
+    qualifier: Option<&str>,
 ) -> Option<Location> {
     // Attempt to use the qualifier's type to narrow down the member
-    let qualifier = resolve_qualifier(node, rope)?;
+    let qualifier = match qualifier {
+        Some(q) => q.to_string(),
+        None => resolve_qualifier(node, rope)?,
+    };
     let qualifier_candidates = index.classes_by_short_name(&qualifier);
     let qualifier_fqcn = resolve_qualifier_fqcn(&qualifier, &qualifier_candidates, file_info);
 
-    if let Some(fqcn) = qualifier_fqcn {
-        if let Some(member) = members
-            .iter()
-            .find(|m| m.fqmn.starts_with(&format!("{}.", fqcn)))
-        {
-            return Some(Location::new(member.uri.clone(), member.range));
-        }
+    let fqcn = qualifier_fqcn?;
+
+    let mut candidates: Vec<_> = members
+        .iter()
+        .filter(|m| m.fqmn.starts_with(&format!("{}.", fqcn)))
+        .collect();
+
+    if candidates.is_empty() {
+        return None;
     }
 
-    members
-        .first()
-        .map(|m| Location::new(m.uri.clone(), m.range))
+    candidates.sort_by_key(|m| {
+        if m.uri.scheme() == "file" || m.uri.scheme() == "untitled" {
+            0
+        } else if m.fqmn.starts_with("java.") {
+            1
+        } else {
+            2
+        }
+    });
+
+    let member = candidates[0];
+    Some(Location::new(member.uri.clone(), member.range))
 }
 
 fn resolve_qualifier(node: Node, rope: &Rope) -> Option<String> {
