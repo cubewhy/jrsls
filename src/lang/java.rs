@@ -1,6 +1,6 @@
 use super::LanguageService;
 use crate::{
-    ast::get_method_call_arg_count,
+    ast::get_call_args,
     state::GlobalIndex,
     utils::{find_definition_in_file, get_node_at_pos, get_node_text, node_range},
 };
@@ -29,19 +29,21 @@ impl LanguageService for JavaService {
     ) -> Option<Location> {
         let (node, target_name) = get_node_at_pos(tree, rope, position)?;
 
-        let expected_argc = get_method_call_arg_count(node);
+        let call_args = get_call_args(node);
 
         tracing::info!(
             "Jump target: {}, Arg count: {:?}",
             target_name,
-            expected_argc
+            call_args.len()
         );
 
         if node.kind() != "identifier" && node.kind() != "type_identifier" {
             return None;
         }
 
-        if let Some(range) = find_definition_in_file(node, &target_name, rope, expected_argc) {
+        if let Some(range) =
+            find_definition_in_file(node, &target_name, rope, &call_args, index, current_uri)
+        {
             return Some(Location::new(
                 lsp_types::Url::parse(current_uri).unwrap(),
                 range,
