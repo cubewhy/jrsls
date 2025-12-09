@@ -177,9 +177,8 @@ impl LanguageServer for LspBackend {
         if let Some(doc) = self.documents.get(&uri) {
             let tree = &doc.tree;
             let text = &doc.text;
-            let mut walker = tree.walk();
 
-            let symbols = traverse_tree(&mut walker, text);
+            let symbols = traverse_node(tree.root_node(), text);
 
             return Ok(Some(DocumentSymbolResponse::Nested(symbols)));
         }
@@ -193,56 +192,66 @@ impl LanguageServer for LspBackend {
     }
 }
 
-fn traverse_tree(walker: &mut tree_sitter::TreeCursor, text: &ropey::Rope) -> Vec<DocumentSymbol> {
+fn traverse_node(node: tree_sitter::Node, rope: &ropey::Rope) -> Vec<DocumentSymbol> {
     let mut symbols = Vec::new();
+    let mut cursor = node.walk();
 
-    if walker.goto_first_child() {
-        loop {
-            let node = walker.node();
-            let kind = node.kind();
+    for child in node.children(&mut cursor) {
+        let kind = child.kind();
 
+        if kind == "field_declaration" {
+            let mut sub_cursor = child.walk();
+            for sub_child in child.children(&mut sub_cursor) {
+                if sub_child.kind() == "variable_declarator" {
+                    let name_node = sub_child.child_by_field_name("name").unwrap_or(sub_child);
+                    let name = get_node_text(name_node, rope);
+
+                    let range = node_range(sub_child, rope);
+                    let selection_range = node_range(name_node, rope);
+
+                    #[allow(deprecated)]
+                    symbols.push(DocumentSymbol {
+                        name,
+                        detail: None, // TODO: field type
+                        kind: SymbolKind::FIELD,
+                        tags: None,
+                        deprecated: None,
+                        range,
+                        selection_range,
+                        children: None,
+                    });
+                }
+            }
+        } else {
             #[allow(deprecated)]
-            let (s_kind, name_node) = match kind {
-                "class_declaration" => (Some(SymbolKind::CLASS), node.child_by_field_name("name")),
-                "interface_declaration" => (
-                    Some(SymbolKind::INTERFACE),
-                    node.child_by_field_name("name"),
-                ),
-                "method_declaration" => {
-                    (Some(SymbolKind::METHOD), node.child_by_field_name("name"))
-                }
-                "constructor_declaration" => (
-                    Some(SymbolKind::CONSTRUCTOR),
-                    node.child_by_field_name("name"),
-                ),
-
-                "field_declaration" => {
-                    let mut cursor = node.walk();
-                    let declarator = node
-                        .children(&mut cursor)
-                        .find(|n| n.kind() == "variable_declarator");
-
-                    let name = declarator.and_then(|n| n.child_by_field_name("name"));
-
-                    (Some(SymbolKind::FIELD), name)
-                }
-
-                _ => (None, None),
+            let symbol_kind = match kind {
+                "class_declaration" => Some(SymbolKind::CLASS),
+                "interface_declaration" => Some(SymbolKind::INTERFACE),
+                "method_declaration" => Some(SymbolKind::METHOD),
+                "constructor_declaration" => Some(SymbolKind::CONSTRUCTOR),
+                "enum_declaration" => Some(SymbolKind::ENUM),
+                _ => None,
             };
 
-            if let Some(s_kind) = s_kind {
-                let name_node = name_node.unwrap_or(node);
-                let name = get_node_text(name_node, text);
+            if let Some(s_kind) = symbol_kind {
+                let name_node = child.child_by_field_name("name").unwrap_or(child);
+                let name = get_node_text(name_node, rope);
 
-                let range = node_range(node, text);
-                let selection_range = node_range(name_node, text);
+                let children = if s_kind == SymbolKind::CLASS
+                    || s_kind == SymbolKind::INTERFACE
+                    || s_kind == SymbolKind::ENUM
+                {
+                    let inner = traverse_node(child, rope);
+                    if inner.is_empty() { None } else { Some(inner) }
+                } else {
+                    None
+                };
 
-                let children = traverse_tree(walker, text);
-
-                tracing::info!("node name: {name}");
+                let range = node_range(child, rope);
+                let selection_range = node_range(name_node, rope);
 
                 #[allow(deprecated)]
-                let symbol = DocumentSymbol {
+                symbols.push(DocumentSymbol {
                     name,
                     detail: None,
                     kind: s_kind,
@@ -250,26 +259,14 @@ fn traverse_tree(walker: &mut tree_sitter::TreeCursor, text: &ropey::Rope) -> Ve
                     deprecated: None,
                     range,
                     selection_range,
-                    children: if children.is_empty() {
-                        None
-                    } else {
-                        Some(children)
-                    },
-                };
-                symbols.push(symbol);
-            } else if kind == "class_body" || kind == "program" {
-                let mut children = traverse_tree(walker, text);
-                symbols.append(&mut children);
-            }
-
-            if !walker.goto_next_sibling() {
-                break;
+                    children,
+                });
+            } else if kind == "class_body" || kind == "program" || kind == "enum_body" {
+                let mut inner = traverse_node(child, rope);
+                symbols.append(&mut inner);
             }
         }
-
-        walker.goto_parent();
     }
-
     symbols
 }
 
